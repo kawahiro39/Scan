@@ -10,11 +10,9 @@ This is an API for scanning documents from images. It uses Google Cloud Vision a
 
 ### Request Body
 
-The API expects the request body to be in `Form-data` format. You must provide **exactly one** of the following three parameters:
+The API expects the request body to be in `multipart/form-data` format. You must provide a single file parameter named `file`.
 
-- `image_file` (File): The image file of the document to process.
-- `image_url` (string): The public URL of the image to process.
-- `image_base64` (string): The base64-encoded string of the image to process.
+- `file` (File): The image file of the document to process.
 
 ### Response Body
 
@@ -33,32 +31,16 @@ On success, the API returns a JSON object with the following keys:
 
 ### Example Usage with cURL
 
-You can use `cURL` to test the API.
+You can use `cURL` to test the API with a local file.
 
-**With File Upload:**
 ```bash
 curl -X POST "http://localhost:8080/scan" \
 -H "Content-Type: multipart/form-data" \
--F "image_file=@/path/to/your/document.jpg"
-```
-
-**With Image URL:**
-```bash
-curl -X POST "http://localhost:8080/scan" \
--H "Content-Type: multipart/form-data" \
--F "image_url=https://example.com/path/to/your/document.jpg"
-```
-
-**With Base64:**
-```bash
-curl -X POST "http://localhost:8080/scan" \
--H "Content-Type: multipart/form-data" \
--F "image_base64=[YOUR_BASE64_STRING]"
+-F "file=@/path/to/your/document.jpg"
 ```
 
 ### Error Handling
 
-- If more than one input parameter is provided, or if none are provided, the API will return an `HTTP 422 Unprocessable Entity` error.
-- If the `image_url` is invalid or the image cannot be downloaded, the API will return an `HTTP 400 Bad Request`.
+- If the `file` parameter is missing or the file is empty, the API will return an `HTTP 400 Bad Request` error.
 - If a document cannot be found in the image, the API will return an `HTTP 400 Bad Request` with the detail: `"書類が見つかりません"` (Document not found).
 - If an unexpected server error occurs, the API will return an `HTTP 500 Internal Server Error`.

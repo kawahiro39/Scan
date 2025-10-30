@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Form, UploadFile
+from fastapi import FastAPI, HTTPException, UploadFile, File
 import base64
 import io
 import math
@@ -6,8 +6,6 @@ from google.cloud import vision
 from PIL import Image
 import cv2
 import numpy as np
-import requests
-from typing import Optional
 
 # FastAPIアプリケーションのインスタンスを作成
 app = FastAPI(
@@ -123,43 +121,18 @@ def generate_pdf_response(image_bytes: bytes) -> str:
     return pdf_base64
 
 @app.post("/scan")
-async def scan_document(
-    image_base64: Optional[str] = Form(None),
-    image_url: Optional[str] = Form(None),
-    image_file: Optional[UploadFile] = None
-):
+async def scan_document(file: UploadFile = File(...)):
     """
-    Receives an image via form-data (as base64, URL, or file upload),
-    processes it, and returns the result.
+    Receives an image file via Form-data, processes it, and returns the result.
     """
     try:
-        # Validate that exactly one of the three options is provided.
-        input_count = sum(1 for item in [image_base64, image_url, image_file] if item is not None)
-        if input_count != 1:
-            raise HTTPException(
-                status_code=422,
-                detail="Exactly one of 'image_base64', 'image_url', or 'image_file' must be provided."
-            )
+        # Read the uploaded file into memory
+        image_bytes = await file.read()
 
-        image_bytes = None
-        if image_base64:
-            try:
-                image_bytes = base64.b64decode(image_base64)
-            except base64.binascii.Error:
-                raise HTTPException(status_code=400, detail="Invalid base64 string.")
+        if not image_bytes:
+            raise HTTPException(status_code=400, detail="The uploaded file is empty.")
 
-        elif image_url:
-            try:
-                response = requests.get(image_url, stream=True)
-                response.raise_for_status()
-                image_bytes = response.content
-            except requests.exceptions.RequestException as e:
-                raise HTTPException(status_code=400, detail=f"Failed to download image from URL: {e}")
-
-        elif image_file:
-            image_bytes = await image_file.read()
-
-        # Process the document in a single, efficient step
+        # Process the document
         corrected_image_bytes, extracted_text = process_document(image_bytes)
 
         # Generate the PDF response from the corrected image
