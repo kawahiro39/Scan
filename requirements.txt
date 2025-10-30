@@ -6,3 +6,7 @@ numpy
 Pillow
 python-multipart
 requests
+torch
+torchvision
+timm
+segmentation-models-pytorch

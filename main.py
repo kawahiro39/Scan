@@ -9,6 +9,9 @@ import cv2
 import numpy as np
 from PIL import Image
 import requests
+import torch
+import torchvision.transforms as T
+import segmentation_models_pytorch as smp
 from requests import RequestException
 
 try:
@@ -50,6 +53,88 @@ def normalize_color_mode(mode: Optional[str]) -> str:
         )
 
     return normalized
+
+
+# Global variable for the AI model to avoid reloading it on every request
+# It will be initialized on the first call to detect_document_with_ai
+AI_MODEL = None
+
+def detect_document_with_ai(img: np.ndarray) -> Optional[np.ndarray]:
+    """Detects a document in an image using a semantic segmentation model."""
+    global AI_MODEL
+
+    # Initialize the model on the first run
+    if AI_MODEL is None:
+        try:
+            # Using a lightweight and fast model. We can try larger models if accuracy is not enough.
+            AI_MODEL = smp.Unet(
+                encoder_name="mobilenet_v2",
+                encoder_weights="imagenet",
+                in_channels=3,
+                classes=1, # We are only detecting one class: document
+            )
+            AI_MODEL.eval()
+            # If a GPU is available, use it.
+            if torch.cuda.is_available():
+                AI_MODEL.to('cuda')
+        except Exception as e:
+            logger.error(f"Failed to load AI model: {e}")
+            return None
+
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    # Pre-process the image
+    preprocess = T.Compose([
+        T.ToTensor(),
+        T.Resize((512, 512), antialias=True),
+        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+
+    # Convert OpenCV BGR image to RGB PIL Image
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    pil_img = Image.fromarray(img_rgb)
+
+    input_tensor = preprocess(pil_img).unsqueeze(0).to(device)
+
+    # Perform inference
+    with torch.no_grad():
+        output = AI_MODEL(input_tensor)
+
+    # Process the output mask
+    mask = torch.sigmoid(output).squeeze().cpu().numpy()
+
+    # Resize mask to original image size
+    original_height, original_width = img.shape[:2]
+    mask_resized = cv2.resize(mask, (original_width, original_height))
+
+    # Threshold the mask to get a binary image
+    _, binary_mask = cv2.threshold((mask_resized * 255).astype(np.uint8), 127, 255, cv2.THRESH_BINARY)
+
+    # Find the largest contour in the mask
+    contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    if not contours:
+        return None
+
+    largest_contour = max(contours, key=cv2.contourArea)
+
+    # Approximate the contour to a polygon
+    perimeter = cv2.arcLength(largest_contour, True)
+    approx = cv2.approxPolyDP(largest_contour, 0.02 * perimeter, True)
+
+    # If the contour has 4 vertices, we assume it's our document
+    if len(approx) == 4:
+        # The points might not be in the correct order, so we order them
+        return order_points(approx.reshape(4, 2).astype(np.float32))
+
+    # If not exactly 4 points, try to find the minimum area rectangle
+    # This can help with slightly irregular shapes
+    try:
+        rect = cv2.minAreaRect(largest_contour)
+        box = cv2.boxPoints(rect)
+        return order_points(box.astype(np.float32))
+    except Exception:
+         return None
 
 
 def order_points(pts: np.ndarray) -> np.ndarray:
@@ -309,14 +394,25 @@ def process_document(image_bytes: bytes, color_mode: str = "mono") -> tuple[byte
             if "does not have permission to write logs" in str(vision_error):
                 ENABLE_CLOUD_VISION = False
 
+    # The result from Google Vision API should be retrieved before AI or contour detection
+    # The existing complex logic for parsing Vision API response already populates `document_points`
+    # if it finds valid geometry. We will respect that.
+
+    # If Vision API did not provide points, try the AI model
+    if document_points is None:
+        document_points = detect_document_with_ai(img)
+
+    # If both Vision and AI fail, fall back to OpenCV contour detection
+    if document_points is None:
+        document_points = detect_document_contour(img)
+
+    # Final check and normalization of points
     if document_points is not None:
         document_points = document_points.astype(np.float32)
         height, width = img.shape[:2]
         document_points[:, 0] = np.clip(document_points[:, 0], 0, width - 1)
         document_points[:, 1] = np.clip(document_points[:, 1], 0, height - 1)
         document_points = order_points(document_points)
-    else:
-        document_points = detect_document_contour(img)
 
     if document_points is None:
         height, width = img.shape[:2]
