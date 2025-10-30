@@ -73,7 +73,7 @@ class ProcessDocumentCropHintsTests(unittest.TestCase):
         ) as ai_detect_mock, patch(
             "main.detect_document_contour"
         ) as detect_mock, patch("main.four_point_transform") as transform_mock:
-            ai_detect_mock.return_value = None # Ensure AI detection is bypassed for this test
+            ai_detect_mock.return_value = None  # Simulate AI failing
             detect_mock.return_value = None
             transform_mock.return_value = np.zeros((10, 10, 3), dtype=np.uint8)
 
@@ -108,7 +108,7 @@ class ProcessDocumentCropHintsTests(unittest.TestCase):
         ) as ai_detect_mock, patch(
             "main.detect_document_contour"
         ) as detect_mock, patch("main.four_point_transform") as transform_mock:
-            ai_detect_mock.return_value = None # Ensure AI detection is bypassed for this test
+            ai_detect_mock.return_value = None  # Simulate AI failing
             detect_mock.return_value = np.array(
                 [[1.0, 1.0], [98.0, 2.0], [97.0, 97.0], [2.0, 98.0]], dtype=np.float32
             )
@@ -128,7 +128,7 @@ class ProcessDocumentCropHintsTests(unittest.TestCase):
         ) as ai_detect_mock, patch(
             "main.detect_document_contour"
         ) as detect_mock, patch("main.four_point_transform") as transform_mock:
-            ai_detect_mock.return_value = None # Ensure AI detection is bypassed for this test
+            ai_detect_mock.return_value = None  # Simulate AI failing
             detect_mock.return_value = np.array(
                 [[0.0, 0.0], [99.0, 0.0], [99.0, 99.0], [0.0, 99.0]], dtype=np.float32
             )
