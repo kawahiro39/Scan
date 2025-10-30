@@ -271,6 +271,32 @@ def process_document(image_bytes: bytes, color_mode: str = "mono") -> tuple[byte
                         candidate = _vertices_to_array(vertices)
                         if candidate is not None:
                             document_points = candidate
+
+                if document_points is None:
+                    crop_response = client.crop_hints(
+                        image=image,
+                        image_context={
+                            "crop_hints_params": {
+                                "aspect_ratios": [1.0]
+                            }
+                        },
+                    )
+
+                    crop_annotation = getattr(
+                        crop_response, "crop_hints_annotation", None
+                    )
+                    crop_hints = (
+                        getattr(crop_annotation, "crop_hints", None)
+                        if crop_annotation
+                        else None
+                    )
+                    if crop_hints:
+                        crop_hint = crop_hints[0]
+                        bounding_poly = getattr(crop_hint, "bounding_poly", None)
+                        if bounding_poly and getattr(bounding_poly, "vertices", None):
+                            candidate = _vertices_to_array(bounding_poly.vertices)
+                            if candidate is not None:
+                                document_points = candidate
         except (DefaultCredentialsError, GoogleAPICallError) as vision_error:
             message = str(vision_error)
             logger.warning("Cloud Vision API unavailable: %s", message)
