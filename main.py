@@ -141,7 +141,9 @@ def enhance_document_image(img: np.ndarray, mode: str = "mono") -> np.ndarray:
 
         # Perform a gentle contrast stretch to bring out colors.
         balanced_float = balanced.astype(np.float32)
-        mean = balanced_float.mean(axis=(0, 1), keepdims=True)
+        mean_color = balanced_float.mean(axis=(0, 1))
+        mean = np.empty_like(balanced_float)
+        mean[:] = mean_color
         enhanced_color = cv2.addWeighted(balanced_float, 1.15, mean, -0.15, 0)
         enhanced_color = np.clip(enhanced_color, 0, 255).astype(np.uint8)
         return enhanced_color

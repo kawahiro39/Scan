@@ -116,6 +116,24 @@ class ProcessDocumentCropHintsTests(unittest.TestCase):
         detect_mock.assert_called_once()
         transform_mock.assert_called_once()
 
+    def test_color_mode_enhancement_completes_without_cv2_error(self):
+        with patch("main.ENABLE_CLOUD_VISION", False), patch(
+            "main.detect_document_contour"
+        ) as detect_mock, patch("main.four_point_transform") as transform_mock:
+            detect_mock.return_value = np.array(
+                [[0.0, 0.0], [99.0, 0.0], [99.0, 99.0], [0.0, 99.0]], dtype=np.float32
+            )
+            transform_mock.return_value = np.full((32, 32, 3), 180, dtype=np.uint8)
+
+            processed_bytes, extracted_text = main.process_document(
+                self.image_bytes, color_mode="color"
+            )
+
+        self.assertIsInstance(processed_bytes, bytes)
+        self.assertEqual(extracted_text, "")
+        detect_mock.assert_called_once()
+        transform_mock.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()
