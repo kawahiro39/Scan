@@ -19,103 +19,50 @@ app = FastAPI(
     version="0.1.0"
 )
 
-def correct_image_orientation(image_bytes: bytes) -> bytes:
+def process_document(image_bytes: bytes) -> tuple[bytes, str]:
     """
-    Corrects the orientation of an image based on text detection from Google Cloud Vision API.
+    Processes a document image using a single Google Cloud Vision API call.
+    This function performs OCR, orientation correction, and perspective correction.
 
     Args:
-        image_bytes: The raw bytes of the image.
+        image_bytes: The raw bytes of the image file.
 
     Returns:
-        The bytes of the orientation-corrected image.
+        A tuple containing:
+        - The bytes of the perspective-corrected document image.
+        - The extracted text (OCR) from the document.
     """
     client = vision.ImageAnnotatorClient()
     image = vision.Image(content=image_bytes)
 
-    # Detect text properties to determine orientation
-    response = client.text_detection(image=image)
-    texts = response.text_annotations
+    # Use document_text_detection to get both text and document boundaries in one call.
+    response = client.document_text_detection(image=image)
 
-    if texts:
-        # The first text annotation is the full text block
-        # Its bounding poly gives information about the page orientation
-        page_orientation = texts[0].bounding_poly
-
-        # Determine the rotation angle
-        # The first annotation is the entire detected text block.
-        # We can calculate the orientation of this block to correct for page rotation.
-        vertices = page_orientation.vertices
-        if len(vertices) == 4:
-            # The vector from top-left to top-right vertex defines the orientation
-            dy = vertices[1].y - vertices[0].y
-            dx = vertices[1].x - vertices[0].x
-
-            # Calculate the angle of this vector. This handles both minor skew
-            # and major rotations (90, 180, 270 degrees).
-            angle = math.degrees(math.atan2(dy, dx))
-
-            # Only perform rotation if the angle is significant enough to indicate
-            # that the image is not upright.
-            if abs(angle) > 1: # Threshold of 1 degree
-                img = Image.open(io.BytesIO(image_bytes))
-                # Pillow's rotate function rotates counter-clockwise.
-                # A negative angle will correct the clockwise tilt.
-                rotated_img = img.rotate(-angle, expand=True)
-
-                output_buffer = io.BytesIO()
-                rotated_img.save(output_buffer, format=img.format or "PNG")
-                return output_buffer.getvalue()
-
-    return image_bytes
-
-def detect_and_correct_perspective(image_bytes: bytes) -> bytes:
-    """
-    Detects a document in the image and corrects its perspective.
-    Returns the corrected image bytes. If no document is found, raises an HTTPException.
-    """
-    client = vision.ImageAnnotatorClient()
-    image = vision.Image(content=image_bytes)
-    response = client.object_localization(image=image)
-    objects = response.localized_object_annotations
-
-    # Find the object with the largest area, assuming it's the document.
-    largest_area = 0
-    document_bounds = None
-
-    img_for_size = Image.open(io.BytesIO(image_bytes))
-    w, h = img_for_size.size
-
-    for obj in objects:
-        if len(obj.bounding_poly.normalized_vertices) == 4:
-            # Calculate the area of the polygon to find the largest one
-            poly = obj.bounding_poly.normalized_vertices
-            # Shoelace formula to calculate polygon area
-            area = 0.5 * abs(sum(poly[i].x * w * (poly[(i + 1) % 4].y * h) - poly[(i + 1) % 4].x * w * (poly[i].y * h) for i in range(4)))
-
-            if area > largest_area:
-                largest_area = area
-                document_bounds = poly
-
-    if not document_bounds:
+    if not response.text_annotations:
         raise HTTPException(status_code=400, detail="書類が見つかりません")
 
-    # Convert the image bytes to an OpenCV image
+    # The first annotation is the entire text block, which gives us the OCR text
+    # and the bounding box for the entire document.
+    annotation = response.text_annotations[0]
+    extracted_text = annotation.description
+    document_bounds = annotation.bounding_poly.vertices
+
+    # Convert the original image bytes to an OpenCV image
     nparr = np.frombuffer(image_bytes, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-    h, w, _ = img.shape
 
-    # Get source points from Vision API response
-    src_pts = np.array([[v.x * w, v.y * h] for v in document_bounds], dtype=np.float32)
+    # The vertices from the Vision API are absolute pixel coordinates.
+    src_pts = np.array([[v.x, v.y] for v in document_bounds], dtype=np.float32)
 
-    # Define the destination points (a rectangle)
-    # Get the width and height of the new image
-    width_ad = np.sqrt(((src_pts[0][0] - src_pts[1][0]) ** 2) + ((src_pts[0][1] - src_pts[1][1]) ** 2))
-    width_bc = np.sqrt(((src_pts[2][0] - src_pts[3][0]) ** 2) + ((src_pts[2][1] - src_pts[3][1]) ** 2))
-    max_width = max(int(width_ad), int(width_bc))
+    # Define the destination rectangle's dimensions based on the bounding box.
+    # This automatically handles orientation.
+    width_top = np.sqrt(((src_pts[0][0] - src_pts[1][0]) ** 2) + ((src_pts[0][1] - src_pts[1][1]) ** 2))
+    width_bottom = np.sqrt(((src_pts[2][0] - src_pts[3][0]) ** 2) + ((src_pts[2][1] - src_pts[3][1]) ** 2))
+    max_width = max(int(width_top), int(width_bottom))
 
-    height_ab = np.sqrt(((src_pts[0][0] - src_pts[3][0]) ** 2) + ((src_pts[0][1] - src_pts[3][1]) ** 2))
-    height_cd = np.sqrt(((src_pts[1][0] - src_pts[2][0]) ** 2) + ((src_pts[1][1] - src_pts[2][1]) ** 2))
-    max_height = max(int(height_ab), int(height_cd))
+    height_left = np.sqrt(((src_pts[0][0] - src_pts[3][0]) ** 2) + ((src_pts[0][1] - src_pts[3][1]) ** 2))
+    height_right = np.sqrt(((src_pts[1][0] - src_pts[2][0]) ** 2) + ((src_pts[1][1] - src_pts[2][1]) ** 2))
+    max_height = max(int(height_left), int(height_right))
 
     dst_pts = np.array([
         [0, 0],
@@ -124,28 +71,16 @@ def detect_and_correct_perspective(image_bytes: bytes) -> bytes:
         [0, max_height - 1]
     ], dtype=np.float32)
 
-    # Get the perspective transform matrix and apply it
+    # Compute the perspective transform matrix and apply it to get the top-down view.
     matrix = cv2.getPerspectiveTransform(src_pts, dst_pts)
     warped = cv2.warpPerspective(img, matrix, (max_width, max_height))
 
-    # Convert the corrected image back to bytes
+    # Convert the corrected OpenCV image back to bytes.
     is_success, buffer = cv2.imencode(".png", warped)
     if not is_success:
         raise HTTPException(status_code=500, detail="Failed to encode corrected image.")
 
-    return buffer.tobytes()
-
-def extract_text(image_bytes: bytes) -> str:
-    """
-    Performs OCR on the given image bytes and returns the extracted text.
-    """
-    client = vision.ImageAnnotatorClient()
-    image = vision.Image(content=image_bytes)
-    response = client.document_text_detection(image=image)
-
-    if response.full_text_annotation:
-        return response.full_text_annotation.text
-    return ""
+    return buffer.tobytes(), extracted_text
 
 def generate_pdf_response(image_bytes: bytes) -> str:
     """
@@ -210,19 +145,13 @@ async def scan_document(request: ScanRequest):
         # Base64デコード試行
         image_bytes = base64.b64decode(request.image_base64)
 
-        # Step 2: Correct image orientation
-        corrected_image_bytes = correct_image_orientation(image_bytes)
+        # Process the document in a single, efficient step
+        corrected_image_bytes, extracted_text = process_document(image_bytes)
 
-        # Step 3: Detect document and apply perspective correction
-        corrected_perspective_bytes = detect_and_correct_perspective(corrected_image_bytes)
+        # Generate the PDF response from the corrected image
+        pdf_base64 = generate_pdf_response(corrected_image_bytes)
 
-        # Step 4: Perform OCR to extract text
-        extracted_text = extract_text(corrected_perspective_bytes)
-
-        # Step 5: Generate a PDF file
-        pdf_base64 = generate_pdf_response(corrected_perspective_bytes)
-
-        # Step 6: Return the final response
+        # Return the final response
         return {
             "extracted_text": extracted_text,
             "pdf_base64": pdf_base64
