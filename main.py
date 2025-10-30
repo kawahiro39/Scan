@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 import base64
 import io
 import logging
@@ -8,6 +8,8 @@ from typing import Optional
 import cv2
 import numpy as np
 from PIL import Image
+import requests
+from requests import RequestException
 
 try:
     from google.api_core.exceptions import GoogleAPICallError
@@ -118,6 +120,24 @@ def enhance_document_image(img: np.ndarray) -> np.ndarray:
     return enhanced_color
 
 
+def fetch_image_from_url(image_url: str) -> bytes:
+    """Downloads an image from the provided URL and returns its bytes."""
+
+    try:
+        response = requests.get(image_url, timeout=10)
+        response.raise_for_status()
+    except RequestException as exc:  # pragma: no cover - network errors
+        raise HTTPException(
+            status_code=400,
+            detail=f"画像のダウンロードに失敗しました: {exc}",
+        ) from exc
+
+    if not response.content:
+        raise HTTPException(status_code=400, detail="ダウンロードした画像が空です。")
+
+    return response.content
+
+
 def process_document(image_bytes: bytes) -> tuple[bytes, str]:
     """
     Processes a document image using a single Google Cloud Vision API call.
@@ -198,7 +218,7 @@ def process_document(image_bytes: bytes) -> tuple[bytes, str]:
 def generate_pdf_response(image_bytes: bytes) -> str:
     """
     Generates a PDF from the image, sizes it appropriately (A4 vs. business card),
-    and returns it as a base64 encoded string.
+    and returns it as a data URI containing a base64 encoded string.
     """
     img = Image.open(io.BytesIO(image_bytes))
     img_width, img_height = img.size
@@ -236,30 +256,41 @@ def generate_pdf_response(image_bytes: bytes) -> str:
     pdf_buffer.seek(0)
 
     pdf_base64 = base64.b64encode(pdf_buffer.getvalue()).decode('utf-8')
-    return pdf_base64
+    return f"data:application/pdf;base64,{pdf_base64}"
 
 @app.post("/scan")
-async def scan_document(file: UploadFile = File(...)):
+async def scan_document(
+    file: Optional[UploadFile] = File(None),
+    image_url: Optional[str] = Form(None),
+):
     """
     Receives an image file via Form-data, processes it, and returns the result.
     """
     try:
-        # Read the uploaded file into memory
-        image_bytes = await file.read()
+        if file is not None:
+            # Read the uploaded file into memory
+            image_bytes = await file.read()
 
-        if not image_bytes:
-            raise HTTPException(status_code=400, detail="The uploaded file is empty.")
+            if not image_bytes:
+                raise HTTPException(status_code=400, detail="The uploaded file is empty.")
+        elif image_url:
+            image_bytes = fetch_image_from_url(image_url)
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="A file or image_url parameter must be provided.",
+            )
 
         # Process the document
         corrected_image_bytes, extracted_text = process_document(image_bytes)
 
         # Generate the PDF response from the corrected image
-        pdf_base64 = generate_pdf_response(corrected_image_bytes)
+        pdf_data_uri = generate_pdf_response(corrected_image_bytes)
 
         # Return the final response
         return {
             "extracted_text": extracted_text,
-            "pdf_base64": pdf_base64
+            "pdf_data_uri": pdf_data_uri
         }
 
     except HTTPException as e:
