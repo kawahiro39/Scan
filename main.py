@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException, UploadFile, File
 import base64
 import io
 import logging
+import os
 from typing import Optional
 
 import cv2
@@ -24,6 +25,13 @@ app = FastAPI(
 )
 
 logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())
+logger.propagate = False
+
+ENABLE_CLOUD_VISION = (
+    vision is not None
+    and os.getenv("ENABLE_CLOUD_VISION", "true").lower() in {"1", "true", "yes"}
+)
 
 
 def order_points(pts: np.ndarray) -> np.ndarray:
@@ -132,7 +140,9 @@ def process_document(image_bytes: bytes) -> tuple[bytes, str]:
     extracted_text = ""
     document_points: Optional[np.ndarray] = None
 
-    if vision is not None:
+    global ENABLE_CLOUD_VISION
+
+    if ENABLE_CLOUD_VISION:
         try:
             client = vision.ImageAnnotatorClient()
             response = client.document_text_detection(image=vision.Image(content=image_bytes))
@@ -149,9 +159,14 @@ def process_document(image_bytes: bytes) -> tuple[bytes, str]:
                         dtype=np.float32,
                     )
         except (DefaultCredentialsError, GoogleAPICallError) as vision_error:
-            logger.warning("Cloud Vision API unavailable: %s", vision_error)
+            message = str(vision_error)
+            logger.warning("Cloud Vision API unavailable: %s", message)
+            if "does not have permission to write logs" in message:
+                ENABLE_CLOUD_VISION = False
         except Exception as vision_error:  # pragma: no cover - safeguard
             logger.warning("Unexpected Cloud Vision error: %s", vision_error)
+            if "does not have permission to write logs" in str(vision_error):
+                ENABLE_CLOUD_VISION = False
 
     if document_points is not None:
         document_points = order_points(document_points)
@@ -159,7 +174,16 @@ def process_document(image_bytes: bytes) -> tuple[bytes, str]:
         document_points = detect_document_contour(img)
 
     if document_points is None:
-        raise HTTPException(status_code=400, detail="書類が見つかりません")
+        height, width = img.shape[:2]
+        document_points = np.array(
+            [
+                [0, 0],
+                [width - 1, 0],
+                [width - 1, height - 1],
+                [0, height - 1],
+            ],
+            dtype=np.float32,
+        )
 
     warped = four_point_transform(img, document_points)
     enhanced = enhance_document_image(warped)
