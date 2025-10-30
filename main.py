@@ -132,8 +132,9 @@ def detect_document_with_ai(img: np.ndarray) -> Optional[np.ndarray]:
         original_height, original_width = img.shape[:2]
         mask_resized = cv2.resize(mask, (original_width, original_height))
 
+        # Use Otsu's thresholding to automatically find the best threshold value
         _, binary_mask = cv2.threshold(
-            (mask_resized * 255).astype(np.uint8), 127, 255, cv2.THRESH_BINARY
+            (mask_resized * 255).astype(np.uint8), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
         )
         contours, _ = cv2.findContours(
             binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
