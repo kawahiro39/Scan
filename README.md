@@ -10,14 +10,22 @@ This is an API for scanning documents from images. It uses Google Cloud Vision a
 
 ### Request Body
 
-The API expects a JSON payload with a single key:
+The API expects a JSON payload with **one** of the following keys. Please provide either `image_base64` or `image_url`, but not both.
 
-- `image_base64` (string): The base64-encoded string of the image you want to process.
+- `image_base64` (string, optional): The base64-encoded string of the image you want to process.
+- `image_url` (string, optional): The public URL of the image you want to process.
 
-**Example JSON Body:**
+**Example JSON Body (using Base64):**
 ```json
 {
   "image_base64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="
+}
+```
+
+**Example JSON Body (using URL):**
+```json
+{
+  "image_url": "https://example.com/path/to/your/document.jpg"
 }
 ```
 
@@ -38,13 +46,24 @@ On success, the API returns a JSON object with the following keys:
 
 ### Example Usage with cURL
 
-You can use `cURL` to test the API. Make sure to replace `[YOUR_BASE64_STRING]` with the actual base64-encoded string of your image.
+You can use `cURL` to test the API.
 
+**With Base64:**
+(Make sure to replace `[YOUR_BASE64_STRING]` with the actual base64-encoded string of your image)
 ```bash
 curl -X POST "http://localhost:8080/scan" \
 -H "Content-Type: application/json" \
 -d '{
   "image_base64": "[YOUR_BASE64_STRING]"
+}'
+```
+
+**With Image URL:**
+```bash
+curl -X POST "http://localhost:8080/scan" \
+-H "Content-Type: application/json" \
+-d '{
+  "image_url": "https://example.com/path/to/your/document.jpg"
 }'
 ```
 
