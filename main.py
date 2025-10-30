@@ -1,5 +1,5 @@
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, validator
 import base64
 import io
 import math
@@ -7,10 +7,21 @@ from google.cloud import vision
 from PIL import Image
 import cv2
 import numpy as np
+import requests
+from typing import Optional
 
 # Pydanticモデルを定義してリクエストボディの型を検証
 class ScanRequest(BaseModel):
-    image_base64: str
+    image_base64: Optional[str] = None
+    image_url: Optional[str] = None
+
+    @validator('image_url')
+    def either_base64_or_url(cls, v, values):
+        if v and values.get('image_base64'):
+            raise ValueError('Provide either image_base64 or image_url, not both.')
+        if not v and not values.get('image_base64'):
+            raise ValueError('Either image_base64 or image_url must be provided.')
+        return v
 
 # FastAPIアプリケーションのインスタンスを作成
 app = FastAPI(
@@ -128,22 +139,25 @@ def generate_pdf_response(image_bytes: bytes) -> str:
 @app.post("/scan")
 async def scan_document(request: ScanRequest):
     """
-    Receives a base64 encoded image, processes it, and returns the result.
-    Processing steps (to be implemented):
-    1. Decode base64 image.
-    2. Correct image orientation.
-    3. Detect document and apply perspective correction.
-    4. Perform OCR to extract text.
-    5. Generate a PDF file.
-    6. Return the PDF (base64) and the extracted text.
+    Receives an image via base64 string or URL, processes it, and returns the result.
     """
     try:
-        # Base64文字列が正しいかどうかの簡易的なチェック
-        if not request.image_base64 or len(request.image_base64) % 4 != 0:
-            raise HTTPException(status_code=400, detail="Invalid base64 string provided.")
+        image_bytes = None
+        if request.image_base64:
+            try:
+                image_bytes = base64.b64decode(request.image_base64)
+            except base64.binascii.Error:
+                raise HTTPException(status_code=400, detail="Invalid base64 string.")
 
-        # Base64デコード試行
-        image_bytes = base64.b64decode(request.image_base64)
+        elif request.image_url:
+            try:
+                response = requests.get(request.image_url, stream=True)
+                response.raise_for_status()  # Raises an HTTPError for bad responses
+                image_bytes = response.content
+            except requests.exceptions.RequestException as e:
+                raise HTTPException(status_code=400, detail=f"Failed to download image from URL: {e}")
+
+        # The Pydantic validator ensures that image_bytes will be set.
 
         # Process the document in a single, efficient step
         corrected_image_bytes, extracted_text = process_document(image_bytes)
@@ -157,10 +171,11 @@ async def scan_document(request: ScanRequest):
             "pdf_base64": pdf_base64
         }
 
-    except base64.binascii.Error:
-        raise HTTPException(status_code=400, detail="Invalid base64 string.")
+    except HTTPException as e:
+        # Re-raise HTTPException to let FastAPI handle it
+        raise e
     except Exception as e:
-        # 予期せぬエラーのハンドリング
+        # Catch any other unexpected errors
         raise HTTPException(status_code=500, detail=f"An internal server error occurred: {str(e)}")
 
 @app.get("/")
