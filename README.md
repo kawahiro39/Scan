@@ -14,6 +14,7 @@ The API expects the request body to be in `multipart/form-data` format. You must
 
 - `file` (File, optional): The image file of the document to process.
 - `image_url` (string, optional): A publicly accessible URL pointing to the image to process.
+- `color_mode` (string, optional): Controls how the image is enhanced. Use `mono` (default) for a binarized, high-contrast result or `color` to preserve the original colors while improving clarity.
 
 At least one of the parameters must be supplied. When both are provided, the uploaded file takes precedence.
 

@@ -36,6 +36,22 @@ ENABLE_CLOUD_VISION = (
 )
 
 
+def normalize_color_mode(mode: Optional[str]) -> str:
+    """Validates and normalizes the requested color mode."""
+
+    if not mode:
+        return "mono"
+
+    normalized = mode.lower()
+    if normalized not in {"mono", "color"}:
+        raise HTTPException(
+            status_code=400,
+            detail="color_mode must be either 'mono' or 'color'.",
+        )
+
+    return normalized
+
+
 def order_points(pts: np.ndarray) -> np.ndarray:
     """Orders four points in the order: top-left, top-right, bottom-right, bottom-left."""
 
@@ -107,9 +123,30 @@ def four_point_transform(image: np.ndarray, pts: np.ndarray) -> np.ndarray:
     return warped
 
 
-def enhance_document_image(img: np.ndarray) -> np.ndarray:
-    """Improves contrast and whiteness to emulate a scanned document."""
+def enhance_document_image(img: np.ndarray, mode: str = "mono") -> np.ndarray:
+    """Enhances the warped document image based on the requested color mode."""
 
+    normalized_mode = (mode or "mono").lower()
+
+    if normalized_mode == "color":
+        # Apply white balance using LAB color space and CLAHE on the luminance channel.
+        lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+        l_channel, a_channel, b_channel = cv2.split(lab)
+
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        l_enhanced = clahe.apply(l_channel)
+
+        lab_enhanced = cv2.merge((l_enhanced, a_channel, b_channel))
+        balanced = cv2.cvtColor(lab_enhanced, cv2.COLOR_LAB2BGR)
+
+        # Perform a gentle contrast stretch to bring out colors.
+        balanced_float = balanced.astype(np.float32)
+        mean = balanced_float.mean(axis=(0, 1), keepdims=True)
+        enhanced_color = cv2.addWeighted(balanced_float, 1.15, mean, -0.15, 0)
+        enhanced_color = np.clip(enhanced_color, 0, 255).astype(np.uint8)
+        return enhanced_color
+
+    # Default to the monochrome pipeline.
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
 
@@ -150,19 +187,23 @@ def fetch_image_from_url(image_url: str) -> bytes:
     return response.content
 
 
-def process_document(image_bytes: bytes) -> tuple[bytes, str]:
+def process_document(image_bytes: bytes, color_mode: str = "mono") -> tuple[bytes, str]:
     """
     Processes a document image using a single Google Cloud Vision API call.
     This function performs OCR, orientation correction, and perspective correction.
 
     Args:
         image_bytes: The raw bytes of the image file.
+        color_mode: Processing mode, either "mono" for binarized output or "color" for
+            color-preserving enhancement.
 
     Returns:
         A tuple containing:
         - The bytes of the perspective-corrected document image.
         - The extracted text (OCR) from the document.
     """
+    normalized_mode = normalize_color_mode(color_mode)
+
     nparr = np.frombuffer(image_bytes, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
@@ -262,7 +303,7 @@ def process_document(image_bytes: bytes) -> tuple[bytes, str]:
         )
 
     warped = four_point_transform(img, document_points)
-    enhanced = enhance_document_image(warped)
+    enhanced = enhance_document_image(warped, normalized_mode)
 
     # Convert the corrected OpenCV image back to bytes.
     is_success, buffer = cv2.imencode(".png", enhanced)
@@ -271,12 +312,24 @@ def process_document(image_bytes: bytes) -> tuple[bytes, str]:
 
     return buffer.tobytes(), extracted_text
 
-def generate_pdf_response(image_bytes: bytes) -> str:
+def generate_pdf_response(image_bytes: bytes, color_mode: str = "mono") -> str:
     """
     Generates a PDF from the image, sizes it appropriately (A4 vs. business card),
-    and returns it as a data URI containing a base64 encoded string.
+    and returns it as a data URI containing a base64 encoded string. The PDF is
+    rendered in grayscale for "mono" mode and RGB for "color" mode.
     """
     img = Image.open(io.BytesIO(image_bytes))
+    normalized_mode = (color_mode or "mono").lower()
+
+    if normalized_mode == "color":
+        img = img.convert("RGB")
+        canvas_mode = "RGB"
+        background_color = "white"
+    else:
+        img = img.convert("L")
+        canvas_mode = "L"
+        background_color = 255
+
     img_width, img_height = img.size
 
     # A4 dimensions in points (72 dpi)
@@ -298,7 +351,7 @@ def generate_pdf_response(image_bytes: bytes) -> str:
 
     # Create a new PDF with the same dimensions as the target size
     pdf_buffer = io.BytesIO()
-    canvas = Image.new('RGB', (pdf_width, pdf_height), 'white')
+    canvas = Image.new(canvas_mode, (pdf_width, pdf_height), background_color)
 
     # Resize image to fit into the canvas while maintaining aspect ratio
     img.thumbnail((pdf_width, pdf_height), Image.Resampling.LANCZOS)
@@ -318,6 +371,7 @@ def generate_pdf_response(image_bytes: bytes) -> str:
 async def scan_document(
     file: Optional[UploadFile] = File(None),
     image_url: Optional[str] = Form(None),
+    color_mode: str = Form("mono"),
 ):
     """
     Receives an image file via Form-data, processes it, and returns the result.
@@ -337,11 +391,17 @@ async def scan_document(
                 detail="A file or image_url parameter must be provided.",
             )
 
+        normalized_color_mode = normalize_color_mode(color_mode)
+
         # Process the document
-        corrected_image_bytes, extracted_text = process_document(image_bytes)
+        corrected_image_bytes, extracted_text = process_document(
+            image_bytes, normalized_color_mode
+        )
 
         # Generate the PDF response from the corrected image
-        pdf_data_uri = generate_pdf_response(corrected_image_bytes)
+        pdf_data_uri = generate_pdf_response(
+            corrected_image_bytes, normalized_color_mode
+        )
 
         # Return the final response
         return {
