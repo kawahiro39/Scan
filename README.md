@@ -22,13 +22,13 @@ At least one of the parameters must be supplied. When both are provided, the upl
 On success, the API returns a JSON object with the following keys:
 
 - `extracted_text` (string): The full text extracted from the document.
-- `pdf_base64` (string): A base64-encoded string representing the corrected and cropped document in PDF format.
+- `pdf_data_uri` (string): A data URI (`data:application/pdf;base64,...`) representing the corrected and cropped document in PDF format.
 
 **Example JSON Response:**
 ```json
 {
   "extracted_text": "This is a sample text extracted from the document.",
-  "pdf_base64": "JVBERi0xLjQKJeLjz9MKMSAwIG9iago8PAovVHlwZSAvQ2F0YWxvZwovUGFnZXMgMiAwIFI..."
+  "pdf_data_uri": "data:application/pdf;base64,JVBERi0xLjQKJeLjz9MKMSAwIG9iago8PAovVHlwZSAvQ2F0YWxvZwovUGFnZXMgMiAwIFI..."
 }
 ```
 

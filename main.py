@@ -218,7 +218,7 @@ def process_document(image_bytes: bytes) -> tuple[bytes, str]:
 def generate_pdf_response(image_bytes: bytes) -> str:
     """
     Generates a PDF from the image, sizes it appropriately (A4 vs. business card),
-    and returns it as a base64 encoded string.
+    and returns it as a data URI containing a base64 encoded string.
     """
     img = Image.open(io.BytesIO(image_bytes))
     img_width, img_height = img.size
@@ -256,7 +256,7 @@ def generate_pdf_response(image_bytes: bytes) -> str:
     pdf_buffer.seek(0)
 
     pdf_base64 = base64.b64encode(pdf_buffer.getvalue()).decode('utf-8')
-    return pdf_base64
+    return f"data:application/pdf;base64,{pdf_base64}"
 
 @app.post("/scan")
 async def scan_document(
@@ -285,12 +285,12 @@ async def scan_document(
         corrected_image_bytes, extracted_text = process_document(image_bytes)
 
         # Generate the PDF response from the corrected image
-        pdf_base64 = generate_pdf_response(corrected_image_bytes)
+        pdf_data_uri = generate_pdf_response(corrected_image_bytes)
 
         # Return the final response
         return {
             "extracted_text": extracted_text,
-            "pdf_base64": pdf_base64
+            "pdf_data_uri": pdf_data_uri
         }
 
     except HTTPException as e:
