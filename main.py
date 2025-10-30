@@ -4,14 +4,12 @@ import io
 import logging
 import os
 from typing import Optional
+from contextlib import asynccontextmanager
 
 import cv2
 import numpy as np
 from PIL import Image
 import requests
-import torch
-import torchvision.transforms as T
-import segmentation_models_pytorch as smp
 from requests import RequestException
 
 try:
@@ -22,16 +20,54 @@ except ImportError:  # pragma: no cover - optional dependency
     vision = None  # type: ignore
     GoogleAPICallError = DefaultCredentialsError = Exception  # type: ignore
 
+import torch
+import torchvision.transforms as T
+import segmentation_models_pytorch as smp
+
+def load_ai_model():
+    """Loads and initializes the AI model."""
+    global AI_MODEL
+    try:
+        logger.info("Initializing AI document detection model for application startup...")
+        model_name = "resnet34"
+        AI_MODEL = smp.Unet(
+            encoder_name=model_name,
+            encoder_weights="imagenet",
+            in_channels=3,
+            classes=1,
+        )
+        AI_MODEL.eval()
+        if torch.cuda.is_available():
+            AI_MODEL.to("cuda")
+        logger.info("AI model initialized successfully and is ready for inference.")
+    except Exception as e:
+        logger.error(f"Fatal error during AI model initialization: {e}")
+        # In a real-world scenario, you might want to prevent the app from starting.
+        AI_MODEL = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup event
+    load_ai_model()
+    yield
+    # Shutdown event (optional, for cleanup)
+    global AI_MODEL
+    AI_MODEL = None
+
+
 # FastAPIアプリケーションのインスタンスを作成
 app = FastAPI(
     title="Document Scan API",
     description="An API to scan documents using Google Cloud Vision and OpenCV.",
-    version="0.1.0"
+    version="0.1.0",
+    lifespan=lifespan
 )
 
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
 logger.propagate = False
+
+AI_MODEL = None
 
 ENABLE_CLOUD_VISION = (
     vision is not None
@@ -55,88 +91,6 @@ def normalize_color_mode(mode: Optional[str]) -> str:
     return normalized
 
 
-# Global variable for the AI model to avoid reloading it on every request
-# It will be initialized on the first call to detect_document_with_ai
-AI_MODEL = None
-
-def detect_document_with_ai(img: np.ndarray) -> Optional[np.ndarray]:
-    """Detects a document in an image using a semantic segmentation model."""
-    global AI_MODEL
-
-    # Initialize the model on the first run
-    if AI_MODEL is None:
-        try:
-            # Using a lightweight and fast model. We can try larger models if accuracy is not enough.
-            AI_MODEL = smp.Unet(
-                encoder_name="mobilenet_v2",
-                encoder_weights="imagenet",
-                in_channels=3,
-                classes=1, # We are only detecting one class: document
-            )
-            AI_MODEL.eval()
-            # If a GPU is available, use it.
-            if torch.cuda.is_available():
-                AI_MODEL.to('cuda')
-        except Exception as e:
-            logger.error(f"Failed to load AI model: {e}")
-            return None
-
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
-    # Pre-process the image
-    preprocess = T.Compose([
-        T.ToTensor(),
-        T.Resize((512, 512), antialias=True),
-        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
-
-    # Convert OpenCV BGR image to RGB PIL Image
-    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    pil_img = Image.fromarray(img_rgb)
-
-    input_tensor = preprocess(pil_img).unsqueeze(0).to(device)
-
-    # Perform inference
-    with torch.no_grad():
-        output = AI_MODEL(input_tensor)
-
-    # Process the output mask
-    mask = torch.sigmoid(output).squeeze().cpu().numpy()
-
-    # Resize mask to original image size
-    original_height, original_width = img.shape[:2]
-    mask_resized = cv2.resize(mask, (original_width, original_height))
-
-    # Threshold the mask to get a binary image
-    _, binary_mask = cv2.threshold((mask_resized * 255).astype(np.uint8), 127, 255, cv2.THRESH_BINARY)
-
-    # Find the largest contour in the mask
-    contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    if not contours:
-        return None
-
-    largest_contour = max(contours, key=cv2.contourArea)
-
-    # Approximate the contour to a polygon
-    perimeter = cv2.arcLength(largest_contour, True)
-    approx = cv2.approxPolyDP(largest_contour, 0.02 * perimeter, True)
-
-    # If the contour has 4 vertices, we assume it's our document
-    if len(approx) == 4:
-        # The points might not be in the correct order, so we order them
-        return order_points(approx.reshape(4, 2).astype(np.float32))
-
-    # If not exactly 4 points, try to find the minimum area rectangle
-    # This can help with slightly irregular shapes
-    try:
-        rect = cv2.minAreaRect(largest_contour)
-        box = cv2.boxPoints(rect)
-        return order_points(box.astype(np.float32))
-    except Exception:
-         return None
-
-
 def order_points(pts: np.ndarray) -> np.ndarray:
     """Orders four points in the order: top-left, top-right, bottom-right, bottom-left."""
 
@@ -150,6 +104,58 @@ def order_points(pts: np.ndarray) -> np.ndarray:
     rect[3] = pts[np.argmax(diff)]
 
     return rect
+
+
+def detect_document_with_ai(img: np.ndarray) -> Optional[np.ndarray]:
+    """Detects a document using a semantic segmentation model."""
+    global AI_MODEL
+    if AI_MODEL is None:
+        logger.error("AI model is not available. Skipping AI detection.")
+        return None
+
+    try:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        preprocess = T.Compose([
+            T.ToTensor(),
+            T.Resize((512, 512), antialias=True),
+            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        pil_img = Image.fromarray(img_rgb)
+        input_tensor = preprocess(pil_img).unsqueeze(0).to(device)
+
+        with torch.no_grad():
+            output = AI_MODEL(input_tensor)
+
+        mask = torch.sigmoid(output).squeeze().cpu().numpy()
+        original_height, original_width = img.shape[:2]
+        mask_resized = cv2.resize(mask, (original_width, original_height))
+
+        _, binary_mask = cv2.threshold(
+            (mask_resized * 255).astype(np.uint8), 127, 255, cv2.THRESH_BINARY
+        )
+        contours, _ = cv2.findContours(
+            binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+
+        if not contours:
+            return None
+
+        largest_contour = max(contours, key=cv2.contourArea)
+
+        # Check if the contour is reasonably large
+        if cv2.contourArea(largest_contour) < (original_width * original_height * 0.1):
+             logger.warning("AI detected a contour that was too small, falling back.")
+             return None
+
+        rect = cv2.minAreaRect(largest_contour)
+        box = cv2.boxPoints(rect)
+        return order_points(box.astype(np.float32))
+
+    except Exception as e:
+        logger.error(f"An error occurred during AI document detection: {e}")
+        return None
 
 
 def detect_document_contour(img: np.ndarray) -> Optional[np.ndarray]:
@@ -298,7 +304,7 @@ def process_document(image_bytes: bytes, color_mode: str = "mono") -> tuple[byte
         raise HTTPException(status_code=400, detail="画像を読み込めませんでした。")
 
     extracted_text = ""
-    document_points: Optional[np.ndarray] = None
+    vision_api_points: Optional[np.ndarray] = None
 
     global ENABLE_CLOUD_VISION
 
@@ -324,7 +330,7 @@ def process_document(image_bytes: bytes, color_mode: str = "mono") -> tuple[byte
                 if not extracted_text and response.text_annotations:
                     extracted_text = response.text_annotations[0].description
 
-                document_points = None
+                vision_api_points = None
 
                 def _vertices_to_array(vertices: list) -> Optional[np.ndarray]:
                     if len(vertices) < 4:
@@ -346,20 +352,20 @@ def process_document(image_bytes: bytes, color_mode: str = "mono") -> tuple[byte
 
                     if len(page_points) >= 4:
                         rect = cv2.minAreaRect(np.array(page_points, dtype=np.float32))
-                        document_points = cv2.boxPoints(rect).astype(np.float32)
+                        vision_api_points = cv2.boxPoints(rect).astype(np.float32)
 
-                if document_points is not None and document_points.shape != (4, 2):
-                    document_points = None
+                if vision_api_points is not None and vision_api_points.shape != (4, 2):
+                    vision_api_points = None
 
-                if document_points is None and response.text_annotations:
+                if vision_api_points is None and response.text_annotations:
                     annotation = response.text_annotations[0]
                     if annotation.bounding_poly:
                         vertices = annotation.bounding_poly.vertices
                         candidate = _vertices_to_array(vertices)
                         if candidate is not None:
-                            document_points = candidate
+                            vision_api_points = candidate
 
-                if document_points is None:
+                if vision_api_points is None:
                     crop_response = client.crop_hints(
                         image=image,
                         image_context={
@@ -383,7 +389,7 @@ def process_document(image_bytes: bytes, color_mode: str = "mono") -> tuple[byte
                         if bounding_poly and getattr(bounding_poly, "vertices", None):
                             candidate = _vertices_to_array(bounding_poly.vertices)
                             if candidate is not None:
-                                document_points = candidate
+                                vision_api_points = candidate
         except (DefaultCredentialsError, GoogleAPICallError) as vision_error:
             message = str(vision_error)
             logger.warning("Cloud Vision API unavailable: %s", message)
@@ -394,27 +400,31 @@ def process_document(image_bytes: bytes, color_mode: str = "mono") -> tuple[byte
             if "does not have permission to write logs" in str(vision_error):
                 ENABLE_CLOUD_VISION = False
 
-    # The result from Google Vision API should be retrieved before AI or contour detection
-    # The existing complex logic for parsing Vision API response already populates `document_points`
-    # if it finds valid geometry. We will respect that.
+    # --- Document Detection Logic ---
+    # Priority Order:
+    # 1. AI-based detection (most accurate for tricky backgrounds)
+    # 2. Google Cloud Vision API hints (good general-purpose)
+    # 3. OpenCV-based contour detection (fallback for simple cases)
+    # 4. Full image (last resort)
 
-    # If Vision API did not provide points, try the AI model
-    if document_points is None:
-        document_points = detect_document_with_ai(img)
-
-    # If both Vision and AI fail, fall back to OpenCV contour detection
-    if document_points is None:
-        document_points = detect_document_contour(img)
-
-    # Final check and normalization of points
-    if document_points is not None:
-        document_points = document_points.astype(np.float32)
-        height, width = img.shape[:2]
-        document_points[:, 0] = np.clip(document_points[:, 0], 0, width - 1)
-        document_points[:, 1] = np.clip(document_points[:, 1], 0, height - 1)
-        document_points = order_points(document_points)
+    document_points = detect_document_with_ai(img)
 
     if document_points is None:
+        logger.info("AI detection failed, falling back to Vision API or OpenCV.")
+        if vision_api_points is not None:
+            logger.info("Using points from Google Cloud Vision API.")
+            document_points = vision_api_points.astype(np.float32)
+            height, width = img.shape[:2]
+            document_points[:, 0] = np.clip(document_points[:, 0], 0, width - 1)
+            document_points[:, 1] = np.clip(document_points[:, 1], 0, height - 1)
+            document_points = order_points(document_points)
+        else:
+            logger.info("Vision API had no points, trying OpenCV contour detection.")
+            document_points = detect_document_contour(img)
+
+    # If all detection methods fail, use the full image.
+    if document_points is None:
+        logger.warning("All detection methods failed. Using full image.")
         height, width = img.shape[:2]
         document_points = np.array(
             [
