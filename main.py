@@ -1,11 +1,20 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File
 import base64
 import io
-import math
-from google.cloud import vision
-from PIL import Image
+import logging
+from typing import Optional
+
 import cv2
 import numpy as np
+from PIL import Image
+
+try:
+    from google.api_core.exceptions import GoogleAPICallError
+    from google.auth.exceptions import DefaultCredentialsError
+    from google.cloud import vision
+except ImportError:  # pragma: no cover - optional dependency
+    vision = None  # type: ignore
+    GoogleAPICallError = DefaultCredentialsError = Exception  # type: ignore
 
 # FastAPIアプリケーションのインスタンスを作成
 app = FastAPI(
@@ -13,6 +22,93 @@ app = FastAPI(
     description="An API to scan documents using Google Cloud Vision and OpenCV.",
     version="0.1.0"
 )
+
+logger = logging.getLogger(__name__)
+
+
+def order_points(pts: np.ndarray) -> np.ndarray:
+    """Orders four points in the order: top-left, top-right, bottom-right, bottom-left."""
+
+    rect = np.zeros((4, 2), dtype="float32")
+    s = pts.sum(axis=1)
+    rect[0] = pts[np.argmin(s)]
+    rect[2] = pts[np.argmax(s)]
+
+    diff = np.diff(pts, axis=1)
+    rect[1] = pts[np.argmin(diff)]
+    rect[3] = pts[np.argmax(diff)]
+
+    return rect
+
+
+def detect_document_contour(img: np.ndarray) -> Optional[np.ndarray]:
+    """Detects the largest 4-point contour that likely represents the document."""
+
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    edged = cv2.Canny(gray, 75, 200)
+    kernel = np.ones((5, 5), np.uint8)
+    closed = cv2.morphologyEx(edged, cv2.MORPH_CLOSE, kernel)
+
+    contours, _ = cv2.findContours(closed, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)
+
+    for contour in contours:
+        perimeter = cv2.arcLength(contour, True)
+        approx = cv2.approxPolyDP(contour, 0.02 * perimeter, True)
+        if len(approx) == 4:
+            return order_points(approx.reshape(4, 2).astype(np.float32))
+
+    return None
+
+
+def four_point_transform(image: np.ndarray, pts: np.ndarray) -> np.ndarray:
+    """Applies a perspective transform using four source points."""
+
+    rect = order_points(pts)
+    (tl, tr, br, bl) = rect
+
+    width_top = np.linalg.norm(tr - tl)
+    width_bottom = np.linalg.norm(br - bl)
+    max_width = max(int(width_top), int(width_bottom), 1)
+
+    height_right = np.linalg.norm(br - tr)
+    height_left = np.linalg.norm(bl - tl)
+    max_height = max(int(height_right), int(height_left), 1)
+
+    dst = np.array(
+        [
+            [0, 0],
+            [max_width - 1, 0],
+            [max_width - 1, max_height - 1],
+            [0, max_height - 1],
+        ],
+        dtype="float32",
+    )
+
+    matrix = cv2.getPerspectiveTransform(rect, dst)
+    warped = cv2.warpPerspective(image, matrix, (max_width, max_height))
+    return warped
+
+
+def enhance_document_image(img: np.ndarray) -> np.ndarray:
+    """Improves contrast and whiteness to emulate a scanned document."""
+
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (3, 3), 0)
+    enhanced = cv2.adaptiveThreshold(
+        blur,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        11,
+        2,
+    )
+
+    enhanced_color = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
+    return enhanced_color
+
 
 def process_document(image_bytes: bytes) -> tuple[bytes, str]:
     """
@@ -27,51 +123,49 @@ def process_document(image_bytes: bytes) -> tuple[bytes, str]:
         - The bytes of the perspective-corrected document image.
         - The extracted text (OCR) from the document.
     """
-    client = vision.ImageAnnotatorClient()
-    image = vision.Image(content=image_bytes)
-
-    # Use document_text_detection to get both text and document boundaries in one call.
-    response = client.document_text_detection(image=image)
-
-    if not response.text_annotations:
-        raise HTTPException(status_code=400, detail="書類が見つかりません")
-
-    # The first annotation is the entire text block, which gives us the OCR text
-    # and the bounding box for the entire document.
-    annotation = response.text_annotations[0]
-    extracted_text = annotation.description
-    document_bounds = annotation.bounding_poly.vertices
-
-    # Convert the original image bytes to an OpenCV image
     nparr = np.frombuffer(image_bytes, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
-    # The vertices from the Vision API are absolute pixel coordinates.
-    src_pts = np.array([[v.x, v.y] for v in document_bounds], dtype=np.float32)
+    if img is None:
+        raise HTTPException(status_code=400, detail="画像を読み込めませんでした。")
 
-    # Define the destination rectangle's dimensions based on the bounding box.
-    # This automatically handles orientation.
-    width_top = np.sqrt(((src_pts[0][0] - src_pts[1][0]) ** 2) + ((src_pts[0][1] - src_pts[1][1]) ** 2))
-    width_bottom = np.sqrt(((src_pts[2][0] - src_pts[3][0]) ** 2) + ((src_pts[2][1] - src_pts[3][1]) ** 2))
-    max_width = max(int(width_top), int(width_bottom))
+    extracted_text = ""
+    document_points: Optional[np.ndarray] = None
 
-    height_left = np.sqrt(((src_pts[0][0] - src_pts[3][0]) ** 2) + ((src_pts[0][1] - src_pts[3][1]) ** 2))
-    height_right = np.sqrt(((src_pts[1][0] - src_pts[2][0]) ** 2) + ((src_pts[1][1] - src_pts[2][1]) ** 2))
-    max_height = max(int(height_left), int(height_right))
+    if vision is not None:
+        try:
+            client = vision.ImageAnnotatorClient()
+            response = client.document_text_detection(image=vision.Image(content=image_bytes))
 
-    dst_pts = np.array([
-        [0, 0],
-        [max_width - 1, 0],
-        [max_width - 1, max_height - 1],
-        [0, max_height - 1]
-    ], dtype=np.float32)
+            if getattr(response, "error", None) and response.error.message:
+                logger.warning("Cloud Vision API error: %s", response.error.message)
+            elif response.text_annotations:
+                annotation = response.text_annotations[0]
+                extracted_text = annotation.description
+                vertices = annotation.bounding_poly.vertices
+                if len(vertices) >= 4:
+                    document_points = np.array(
+                        [[v.x, v.y] for v in vertices[:4]],
+                        dtype=np.float32,
+                    )
+        except (DefaultCredentialsError, GoogleAPICallError) as vision_error:
+            logger.warning("Cloud Vision API unavailable: %s", vision_error)
+        except Exception as vision_error:  # pragma: no cover - safeguard
+            logger.warning("Unexpected Cloud Vision error: %s", vision_error)
 
-    # Compute the perspective transform matrix and apply it to get the top-down view.
-    matrix = cv2.getPerspectiveTransform(src_pts, dst_pts)
-    warped = cv2.warpPerspective(img, matrix, (max_width, max_height))
+    if document_points is not None:
+        document_points = order_points(document_points)
+    else:
+        document_points = detect_document_contour(img)
+
+    if document_points is None:
+        raise HTTPException(status_code=400, detail="書類が見つかりません")
+
+    warped = four_point_transform(img, document_points)
+    enhanced = enhance_document_image(warped)
 
     # Convert the corrected OpenCV image back to bytes.
-    is_success, buffer = cv2.imencode(".png", warped)
+    is_success, buffer = cv2.imencode(".png", enhanced)
     if not is_success:
         raise HTTPException(status_code=500, detail="Failed to encode corrected image.")
 
