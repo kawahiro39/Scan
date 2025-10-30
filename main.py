@@ -57,16 +57,21 @@ def detect_document_contour(img: np.ndarray) -> Optional[np.ndarray]:
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (5, 5), 0)
 
-    edged = cv2.Canny(gray, 75, 200)
+    v = np.median(gray)
+    lower = int(max(0, 0.66 * v))
+    upper = int(min(255, 1.33 * v))
+    edged = cv2.Canny(gray, lower, upper)
+
     kernel = np.ones((5, 5), np.uint8)
     closed = cv2.morphologyEx(edged, cv2.MORPH_CLOSE, kernel)
+    closed = cv2.dilate(closed, kernel, iterations=1)
 
     contours, _ = cv2.findContours(closed, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
     contours = sorted(contours, key=cv2.contourArea, reverse=True)
 
     for contour in contours:
         perimeter = cv2.arcLength(contour, True)
-        approx = cv2.approxPolyDP(contour, 0.02 * perimeter, True)
+        approx = cv2.approxPolyDP(contour, 0.015 * perimeter, True)
         if len(approx) == 4:
             return order_points(approx.reshape(4, 2).astype(np.float32))
 
@@ -106,16 +111,23 @@ def enhance_document_image(img: np.ndarray) -> np.ndarray:
     """Improves contrast and whiteness to emulate a scanned document."""
 
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (3, 3), 0)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    equalized = clahe.apply(blurred)
+
+    denoised = cv2.fastNlMeansDenoising(equalized, None, 30, 7, 21)
+
     enhanced = cv2.adaptiveThreshold(
-        blur,
+        denoised,
         255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY,
-        11,
-        2,
+        15,
+        8,
     )
 
+    enhanced = cv2.medianBlur(enhanced, 3)
     enhanced_color = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
     return enhanced_color
 
@@ -165,19 +177,59 @@ def process_document(image_bytes: bytes) -> tuple[bytes, str]:
     if ENABLE_CLOUD_VISION:
         try:
             client = vision.ImageAnnotatorClient()
-            response = client.document_text_detection(image=vision.Image(content=image_bytes))
+            image = vision.Image(content=image_bytes)
+            response = client.document_text_detection(
+                image=image,
+                image_context={"language_hints": ["ja", "en"]},
+            )
 
             if getattr(response, "error", None) and response.error.message:
                 logger.warning("Cloud Vision API error: %s", response.error.message)
-            elif response.text_annotations:
-                annotation = response.text_annotations[0]
-                extracted_text = annotation.description
-                vertices = annotation.bounding_poly.vertices
-                if len(vertices) >= 4:
-                    document_points = np.array(
-                        [[v.x, v.y] for v in vertices[:4]],
-                        dtype=np.float32,
-                    )
+            else:
+                extracted_text = (
+                    getattr(response, "full_text_annotation", None).text
+                    if getattr(response, "full_text_annotation", None)
+                    and response.full_text_annotation.text
+                    else ""
+                )
+
+                if not extracted_text and response.text_annotations:
+                    extracted_text = response.text_annotations[0].description
+
+                document_points = None
+
+                def _vertices_to_array(vertices: list) -> Optional[np.ndarray]:
+                    if len(vertices) < 4:
+                        return None
+                    arr = np.array([[v.x, v.y] for v in vertices[:4]], dtype=np.float32)
+                    if arr.shape != (4, 2):
+                        return None
+                    return arr
+
+                if (
+                    getattr(response, "full_text_annotation", None)
+                    and response.full_text_annotation.pages
+                ):
+                    page = response.full_text_annotation.pages[0]
+                    page_points = []
+                    for block in page.blocks:
+                        for vertex in block.bounding_box.vertices:
+                            page_points.append([vertex.x, vertex.y])
+
+                    if len(page_points) >= 4:
+                        rect = cv2.minAreaRect(np.array(page_points, dtype=np.float32))
+                        document_points = cv2.boxPoints(rect).astype(np.float32)
+
+                if document_points is not None and document_points.shape != (4, 2):
+                    document_points = None
+
+                if document_points is None and response.text_annotations:
+                    annotation = response.text_annotations[0]
+                    if annotation.bounding_poly:
+                        vertices = annotation.bounding_poly.vertices
+                        candidate = _vertices_to_array(vertices)
+                        if candidate is not None:
+                            document_points = candidate
         except (DefaultCredentialsError, GoogleAPICallError) as vision_error:
             message = str(vision_error)
             logger.warning("Cloud Vision API unavailable: %s", message)
@@ -189,6 +241,10 @@ def process_document(image_bytes: bytes) -> tuple[bytes, str]:
                 ENABLE_CLOUD_VISION = False
 
     if document_points is not None:
+        document_points = document_points.astype(np.float32)
+        height, width = img.shape[:2]
+        document_points[:, 0] = np.clip(document_points[:, 0], 0, width - 1)
+        document_points[:, 1] = np.clip(document_points[:, 1], 0, height - 1)
         document_points = order_points(document_points)
     else:
         document_points = detect_document_contour(img)
