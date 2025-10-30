@@ -271,6 +271,51 @@ def process_document(image_bytes: bytes, color_mode: str = "mono") -> tuple[byte
                         candidate = _vertices_to_array(vertices)
                         if candidate is not None:
                             document_points = candidate
+
+                crop_hint_points: Optional[np.ndarray] = None
+
+                if document_points is None:
+                    try:
+                        crop_response = client.crop_hints(
+                            image=image,
+                            image_context={
+                                "crop_hints_params": {"aspect_ratios": [1.0]}
+                            },
+                        )
+
+                        if (
+                            getattr(crop_response, "error", None)
+                            and crop_response.error.message
+                        ):
+                            logger.warning(
+                                "Cloud Vision crop hints error: %s",
+                                crop_response.error.message,
+                            )
+                        else:
+                            hints_annotation = getattr(
+                                crop_response, "crop_hints_annotation", None
+                            )
+                            if hints_annotation and hints_annotation.crop_hints:
+                                top_hint = hints_annotation.crop_hints[0]
+                                polygon = getattr(top_hint, "bounding_poly", None)
+                                if polygon and getattr(polygon, "vertices", None):
+                                    candidate = _vertices_to_array(polygon.vertices)
+                                    if candidate is not None:
+                                        crop_hint_points = candidate
+                    except (DefaultCredentialsError, GoogleAPICallError) as crop_error:
+                        message = str(crop_error)
+                        logger.warning("Cloud Vision crop hints unavailable: %s", message)
+                        if "does not have permission to write logs" in message:
+                            ENABLE_CLOUD_VISION = False
+                    except Exception as crop_error:  # pragma: no cover - safeguard
+                        logger.warning(
+                            "Unexpected Cloud Vision crop hints error: %s", crop_error
+                        )
+                        if "does not have permission to write logs" in str(crop_error):
+                            ENABLE_CLOUD_VISION = False
+
+                if document_points is None and crop_hint_points is not None:
+                    document_points = crop_hint_points
         except (DefaultCredentialsError, GoogleAPICallError) as vision_error:
             message = str(vision_error)
             logger.warning("Cloud Vision API unavailable: %s", message)
