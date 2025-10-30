@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 import base64
 import io
 import logging
@@ -8,6 +8,8 @@ from typing import Optional
 import cv2
 import numpy as np
 from PIL import Image
+import requests
+from requests import RequestException
 
 try:
     from google.api_core.exceptions import GoogleAPICallError
@@ -116,6 +118,24 @@ def enhance_document_image(img: np.ndarray) -> np.ndarray:
 
     enhanced_color = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
     return enhanced_color
+
+
+def fetch_image_from_url(image_url: str) -> bytes:
+    """Downloads an image from the provided URL and returns its bytes."""
+
+    try:
+        response = requests.get(image_url, timeout=10)
+        response.raise_for_status()
+    except RequestException as exc:  # pragma: no cover - network errors
+        raise HTTPException(
+            status_code=400,
+            detail=f"画像のダウンロードに失敗しました: {exc}",
+        ) from exc
+
+    if not response.content:
+        raise HTTPException(status_code=400, detail="ダウンロードした画像が空です。")
+
+    return response.content
 
 
 def process_document(image_bytes: bytes) -> tuple[bytes, str]:
@@ -239,16 +259,27 @@ def generate_pdf_response(image_bytes: bytes) -> str:
     return pdf_base64
 
 @app.post("/scan")
-async def scan_document(file: UploadFile = File(...)):
+async def scan_document(
+    file: Optional[UploadFile] = File(None),
+    image_url: Optional[str] = Form(None),
+):
     """
     Receives an image file via Form-data, processes it, and returns the result.
     """
     try:
-        # Read the uploaded file into memory
-        image_bytes = await file.read()
+        if file is not None:
+            # Read the uploaded file into memory
+            image_bytes = await file.read()
 
-        if not image_bytes:
-            raise HTTPException(status_code=400, detail="The uploaded file is empty.")
+            if not image_bytes:
+                raise HTTPException(status_code=400, detail="The uploaded file is empty.")
+        elif image_url:
+            image_bytes = fetch_image_from_url(image_url)
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="A file or image_url parameter must be provided.",
+            )
 
         # Process the document
         corrected_image_bytes, extracted_text = process_document(image_bytes)

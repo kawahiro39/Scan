@@ -10,9 +10,12 @@ This is an API for scanning documents from images. It uses Google Cloud Vision a
 
 ### Request Body
 
-The API expects the request body to be in `multipart/form-data` format. You must provide a single file parameter named `file`.
+The API expects the request body to be in `multipart/form-data` format. You must provide either a file upload or an image URL.
 
-- `file` (File): The image file of the document to process.
+- `file` (File, optional): The image file of the document to process.
+- `image_url` (string, optional): A publicly accessible URL pointing to the image to process.
+
+At least one of the parameters must be supplied. When both are provided, the uploaded file takes precedence.
 
 ### Response Body
 
@@ -41,6 +44,6 @@ curl -X POST "http://localhost:8080/scan" \
 
 ### Error Handling
 
-- If the `file` parameter is missing or the file is empty, the API will return an `HTTP 400 Bad Request` error.
+- If neither a valid file nor an `image_url` is provided, or the uploaded file is empty, the API will return an `HTTP 400 Bad Request` error.
 - If a document cannot be found in the image, the API will return an `HTTP 400 Bad Request` with the detail: `"書類が見つかりません"` (Document not found).
 - If an unexpected server error occurs, the API will return an `HTTP 500 Internal Server Error`.
