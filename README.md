@@ -10,24 +10,11 @@ This is an API for scanning documents from images. It uses Google Cloud Vision a
 
 ### Request Body
 
-The API expects a JSON payload with **one** of the following keys. Please provide either `image_base64` or `image_url`, but not both.
+The API expects the request body to be in `Form-data` format. You must provide **exactly one** of the following three parameters:
 
-- `image_base64` (string, optional): The base64-encoded string of the image you want to process.
-- `image_url` (string, optional): The public URL of the image you want to process.
-
-**Example JSON Body (using Base64):**
-```json
-{
-  "image_base64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="
-}
-```
-
-**Example JSON Body (using URL):**
-```json
-{
-  "image_url": "https://example.com/path/to/your/document.jpg"
-}
-```
+- `image_file` (File): The image file of the document to process.
+- `image_url` (string): The public URL of the image to process.
+- `image_base64` (string): The base64-encoded string of the image to process.
 
 ### Response Body
 
@@ -48,33 +35,30 @@ On success, the API returns a JSON object with the following keys:
 
 You can use `cURL` to test the API.
 
-**With Base64:**
-(Make sure to replace `[YOUR_BASE64_STRING]` with the actual base64-encoded string of your image)
+**With File Upload:**
 ```bash
 curl -X POST "http://localhost:8080/scan" \
--H "Content-Type: application/json" \
--d '{
-  "image_base64": "[YOUR_BASE64_STRING]"
-}'
+-H "Content-Type: multipart/form-data" \
+-F "image_file=@/path/to/your/document.jpg"
 ```
 
 **With Image URL:**
 ```bash
 curl -X POST "http://localhost:8080/scan" \
--H "Content-Type: application/json" \
--d '{
-  "image_url": "https://example.com/path/to/your/document.jpg"
-}'
+-H "Content-Type: multipart/form-data" \
+-F "image_url=https://example.com/path/to/your/document.jpg"
 ```
 
-To get the base64 string of an image file (e.g., `my_document.png`) on macOS or Linux, you can use the following command:
-
+**With Base64:**
 ```bash
-base64 -i my_document.png
+curl -X POST "http://localhost:8080/scan" \
+-H "Content-Type: multipart/form-data" \
+-F "image_base64=[YOUR_BASE64_STRING]"
 ```
 
 ### Error Handling
 
-- If the request body is invalid or the base64 string is malformed, the API will return an `HTTP 400 Bad Request` error.
+- If more than one input parameter is provided, or if none are provided, the API will return an `HTTP 422 Unprocessable Entity` error.
+- If the `image_url` is invalid or the image cannot be downloaded, the API will return an `HTTP 400 Bad Request`.
 - If a document cannot be found in the image, the API will return an `HTTP 400 Bad Request` with the detail: `"書類が見つかりません"` (Document not found).
 - If an unexpected server error occurs, the API will return an `HTTP 500 Internal Server Error`.
