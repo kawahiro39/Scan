@@ -1,5 +1,5 @@
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel
 import base64
 import io
 import math
@@ -8,24 +8,12 @@ from PIL import Image
 import cv2
 import numpy as np
 import requests
-from typing import Optional, Dict, Any
+from typing import Optional
 
 # Pydanticモデルを定義してリクエストボディの型を検証
 class ScanRequest(BaseModel):
     image_base64: Optional[str] = None
     image_url: Optional[str] = None
-
-    @model_validator(mode='before')
-    def check_exactly_one_field(cls, values: Dict[str, Any]) -> Dict[str, Any]:
-        if isinstance(values, dict):
-            # Count how many of the optional fields are provided
-            provided_fields = sum(
-                1 for field in ['image_base64', 'image_url'] if values.get(field)
-            )
-            # If the count is not exactly 1, raise an error
-            if provided_fields != 1:
-                raise ValueError('Exactly one of "image_base64" or "image_url" must be provided.')
-        return values
 
 # FastAPIアプリケーションのインスタンスを作成
 app = FastAPI(
@@ -146,6 +134,14 @@ async def scan_document(request: ScanRequest):
     Receives an image via base64 string or URL, processes it, and returns the result.
     """
     try:
+        # Manual validation of input fields
+        if (request.image_base64 and request.image_url) or \
+           (not request.image_base64 and not request.image_url):
+            raise HTTPException(
+                status_code=422,
+                detail='Exactly one of "image_base64" or "image_url" must be provided.'
+            )
+
         image_bytes = None
         if request.image_base64:
             try:
