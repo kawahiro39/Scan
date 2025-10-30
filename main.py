@@ -1,5 +1,5 @@
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, validator
+from pydantic import BaseModel, model_validator
 import base64
 import io
 import math
@@ -8,20 +8,24 @@ from PIL import Image
 import cv2
 import numpy as np
 import requests
-from typing import Optional
+from typing import Optional, Dict, Any
 
 # Pydanticモデルを定義してリクエストボディの型を検証
 class ScanRequest(BaseModel):
     image_base64: Optional[str] = None
     image_url: Optional[str] = None
 
-    @validator('image_url')
-    def either_base64_or_url(cls, v, values):
-        if v and values.get('image_base64'):
-            raise ValueError('Provide either image_base64 or image_url, not both.')
-        if not v and not values.get('image_base64'):
-            raise ValueError('Either image_base64 or image_url must be provided.')
-        return v
+    @model_validator(mode='before')
+    def check_exactly_one_field(cls, values: Dict[str, Any]) -> Dict[str, Any]:
+        if isinstance(values, dict):
+            # Count how many of the optional fields are provided
+            provided_fields = sum(
+                1 for field in ['image_base64', 'image_url'] if values.get(field)
+            )
+            # If the count is not exactly 1, raise an error
+            if provided_fields != 1:
+                raise ValueError('Exactly one of "image_base64" or "image_url" must be provided.')
+        return values
 
 # FastAPIアプリケーションのインスタンスを作成
 app = FastAPI(
