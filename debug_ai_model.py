@@ -58,7 +58,7 @@ def main():
     ai_model.to(device)
     print("AI model loaded.")
 
-    image_path = "sample_images/problematic_image_2.png"
+    image_path = "sample_images/problematic_image.png"
     print(f"Loading image: {image_path}")
     img = cv2.imread(image_path)
     if img is None:
@@ -88,19 +88,31 @@ def main():
     cv2.imwrite("debug_output/raw_mask.png", raw_mask_visual)
     print("Saved raw model mask to debug_output/raw_mask.png")
 
-    # --- Existing Thresholding (for comparison) ---
-    _, binary_mask = cv2.threshold(
-        raw_mask_visual, 127, 255, cv2.THRESH_BINARY
-    )
-    cv2.imwrite("debug_output/binary_mask_hardcoded.png", binary_mask)
-    print("Saved binary mask (hardcoded threshold) to debug_output/binary_mask_hardcoded.png")
+    # --- New Connected Components Logic ---
+    print("Applying connected components logic...")
+    binary_mask = ((mask_resized > 0.5) * 255).astype(np.uint8)
+    cv2.imwrite("debug_output/binary_mask.png", binary_mask)
+    print("Saved binary mask to debug_output/binary_mask.png")
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary_mask, 4, cv2.CV_32S)
+
+    if num_labels < 2:
+        print("No components found in the mask.")
+        return
+
+    largest_label = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
+
+    largest_component_mask = np.zeros_like(binary_mask)
+    largest_component_mask[labels == largest_label] = 255
+    cv2.imwrite("debug_output/largest_component_mask.png", largest_component_mask)
+    print("Saved largest component mask to debug_output/largest_component_mask.png")
 
     contours, _ = cv2.findContours(
-        binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        largest_component_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
     )
 
     if not contours:
-        print("No contours found with hardcoded threshold.")
+        print("No contours found after component analysis.")
         return
 
     largest_contour = max(contours, key=cv2.contourArea)
