@@ -106,6 +106,53 @@ def order_points(pts: np.ndarray) -> np.ndarray:
     return rect
 
 
+def detect_document_with_vision_api(image_bytes: bytes) -> Optional[np.ndarray]:
+    """
+    Detects document boundaries using the Google Cloud Vision API's document text detection.
+    """
+    global ENABLE_CLOUD_VISION
+    if not ENABLE_CLOUD_VISION:
+        return None
+
+    try:
+        client = vision.ImageAnnotatorClient()
+        image = vision.Image(content=image_bytes)
+        response = client.document_text_detection(image=image)
+
+        if getattr(response, "error", None) and response.error.message:
+            logger.warning("Cloud Vision API error: %s", response.error.message)
+            return None
+
+        full_text = getattr(response, "full_text_annotation", None)
+        if not full_text or not full_text.pages:
+            logger.info("Vision API did not find a document page.")
+            return None
+
+        # Get the bounding box for the first (and likely only) page.
+        page = full_text.pages[0]
+        vertices = page.bounding_box.vertices
+
+        if len(vertices) != 4:
+            logger.warning(f"Vision API found a page with {len(vertices)} vertices, expected 4.")
+            return None
+
+        # Convert to the required numpy format
+        points = np.array([[v.x, v.y] for v in vertices], dtype=np.float32)
+        return order_points(points)
+
+    except (DefaultCredentialsError, GoogleAPICallError) as vision_error:
+        message = str(vision_error)
+        logger.warning("Cloud Vision API unavailable: %s", message)
+        if "does not have permission to write logs" in message:
+            ENABLE_CLOUD_VISION = False
+        return None
+    except Exception as vision_error:  # pragma: no cover - safeguard
+        logger.warning("Unexpected Cloud Vision error: %s", vision_error)
+        if "does not have permission to write logs" in str(vision_error):
+            ENABLE_CLOUD_VISION = False # type: ignore
+        return None
+
+
 def detect_document_with_ai(img: np.ndarray) -> Optional[np.ndarray]:
     """Detects a document using a semantic segmentation model."""
     global AI_MODEL
@@ -320,12 +367,13 @@ def process_document(image_bytes: bytes, color_mode: str = "mono") -> tuple[byte
         raise HTTPException(status_code=400, detail="画像を読み込めませんでした。")
 
     extracted_text = ""
-    vision_api_points: Optional[np.ndarray] = None
-
     global ENABLE_CLOUD_VISION
 
     if ENABLE_CLOUD_VISION:
         try:
+            # We still call document_text_detection here because it provides both OCR
+            # and (with our new function) boundary detection.
+            # This is more efficient than making two separate API calls.
             client = vision.ImageAnnotatorClient()
             image = vision.Image(content=image_bytes)
             response = client.document_text_detection(
@@ -334,114 +382,68 @@ def process_document(image_bytes: bytes, color_mode: str = "mono") -> tuple[byte
             )
 
             if getattr(response, "error", None) and response.error.message:
-                logger.warning("Cloud Vision API error: %s", response.error.message)
+                logger.warning("Cloud Vision API error during OCR: %s", response.error.message)
             else:
-                extracted_text = (
-                    getattr(response, "full_text_annotation", None).text
-                    if getattr(response, "full_text_annotation", None)
-                    and response.full_text_annotation.text
-                    else ""
-                )
-
-                if not extracted_text and response.text_annotations:
+                full_text = getattr(response, "full_text_annotation", None)
+                if full_text and full_text.text:
+                    extracted_text = full_text.text
+                elif response.text_annotations:
                     extracted_text = response.text_annotations[0].description
 
-                vision_api_points = None
-
-                def _vertices_to_array(vertices: list) -> Optional[np.ndarray]:
-                    if len(vertices) < 4:
-                        return None
-                    arr = np.array([[v.x, v.y] for v in vertices[:4]], dtype=np.float32)
-                    if arr.shape != (4, 2):
-                        return None
-                    return arr
-
-                if (
-                    getattr(response, "full_text_annotation", None)
-                    and response.full_text_annotation.pages
-                ):
-                    page = response.full_text_annotation.pages[0]
-                    page_points = []
-                    for block in page.blocks:
-                        for vertex in block.bounding_box.vertices:
-                            page_points.append([vertex.x, vertex.y])
-
-                    if len(page_points) >= 4:
-                        rect = cv2.minAreaRect(np.array(page_points, dtype=np.float32))
-                        vision_api_points = cv2.boxPoints(rect).astype(np.float32)
-
-                if vision_api_points is not None and vision_api_points.shape != (4, 2):
-                    vision_api_points = None
-
-                if vision_api_points is None and response.text_annotations:
-                    annotation = response.text_annotations[0]
-                    if annotation.bounding_poly:
-                        vertices = annotation.bounding_poly.vertices
-                        candidate = _vertices_to_array(vertices)
-                        if candidate is not None:
-                            vision_api_points = candidate
-
-                if vision_api_points is None:
-                    crop_response = client.crop_hints(
-                        image=image,
-                        image_context={
-                            "crop_hints_params": {
-                                "aspect_ratios": [1.0]
-                            }
-                        },
-                    )
-
-                    crop_annotation = getattr(
-                        crop_response, "crop_hints_annotation", None
-                    )
-                    crop_hints = (
-                        getattr(crop_annotation, "crop_hints", None)
-                        if crop_annotation
-                        else None
-                    )
-                    if crop_hints:
-                        crop_hint = crop_hints[0]
-                        bounding_poly = getattr(crop_hint, "bounding_poly", None)
-                        if bounding_poly and getattr(bounding_poly, "vertices", None):
-                            candidate = _vertices_to_array(bounding_poly.vertices)
-                            if candidate is not None:
-                                vision_api_points = candidate
         except (DefaultCredentialsError, GoogleAPICallError) as vision_error:
             message = str(vision_error)
-            logger.warning("Cloud Vision API unavailable: %s", message)
+            logger.warning("Cloud Vision API unavailable for OCR: %s", message)
             if "does not have permission to write logs" in message:
                 ENABLE_CLOUD_VISION = False
         except Exception as vision_error:  # pragma: no cover - safeguard
-            logger.warning("Unexpected Cloud Vision error: %s", vision_error)
+            logger.warning("Unexpected Cloud Vision error during OCR: %s", vision_error)
             if "does not have permission to write logs" in str(vision_error):
                 ENABLE_CLOUD_VISION = False
 
+
     # --- Document Detection Logic ---
-    # Priority Order:
-    # 1. AI-based detection (most accurate for tricky backgrounds)
-    # 2. Google Cloud Vision API hints (good general-purpose)
-    # 3. OpenCV-based contour detection (fallback for simple cases)
+    # Accuracy-First Priority Order:
+    # 1. Google Cloud Vision API (most accurate)
+    # 2. AI-based detection (robust fallback)
+    # 3. OpenCV-based contour detection (fastest, final fallback)
     # 4. Full image (last resort)
 
-    document_points = detect_document_with_ai(img)
+    document_points = None
+    height, width = img.shape[:2]
+    image_area = float(height * width)
 
+    # 1. Try Google Cloud Vision API
+    logger.info("Attempting detection with Vision API.")
+    vision_points = detect_document_with_vision_api(image_bytes)
+    if vision_points is not None and (cv2.contourArea(vision_points) / image_area) > 0.1:
+        logger.info("Vision API detection successful.")
+        document_points = vision_points
+    else:
+        logger.info("Vision API detection failed or result was too small, falling back to AI model.")
+
+    # 2. Try AI Model if Vision API failed
     if document_points is None:
-        logger.info("AI detection failed, falling back to Vision API or OpenCV.")
-        if vision_api_points is not None:
-            logger.info("Using points from Google Cloud Vision API.")
-            document_points = vision_api_points.astype(np.float32)
-            height, width = img.shape[:2]
-            document_points[:, 0] = np.clip(document_points[:, 0], 0, width - 1)
-            document_points[:, 1] = np.clip(document_points[:, 1], 0, height - 1)
-            document_points = order_points(document_points)
+        logger.info("Attempting detection with AI model.")
+        ai_points = detect_document_with_ai(img)
+        if ai_points is not None:
+             logger.info("AI detection successful.")
+             document_points = ai_points
         else:
-            logger.info("Vision API had no points, trying OpenCV contour detection.")
-            document_points = detect_document_contour(img)
+            logger.info("AI detection failed, falling back to OpenCV.")
 
-    # If all detection methods fail, use the full image.
+    # 3. Try OpenCV if both other methods failed
+    if document_points is None:
+        logger.info("Attempting detection with OpenCV.")
+        opencv_points = detect_document_contour(img)
+        if opencv_points is not None and (cv2.contourArea(opencv_points) / image_area) > 0.1:
+            logger.info("OpenCV detection successful.")
+            document_points = opencv_points
+        else:
+             logger.info("OpenCV detection failed.")
+
+    # 4. Final Fallback to full image
     if document_points is None:
         logger.warning("All detection methods failed. Using full image.")
-        height, width = img.shape[:2]
         document_points = np.array(
             [
                 [0, 0],
