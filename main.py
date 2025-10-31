@@ -132,15 +132,30 @@ def detect_document_with_ai(img: np.ndarray) -> Optional[np.ndarray]:
         original_height, original_width = img.shape[:2]
         mask_resized = cv2.resize(mask, (original_width, original_height))
 
-        # Use Otsu's thresholding to automatically find the best threshold value
-        _, binary_mask = cv2.threshold(
-            (mask_resized * 255).astype(np.uint8), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
-        )
+        # Convert to binary mask using a fixed threshold
+        binary_mask = ((mask_resized > 0.5) * 255).astype(np.uint8)
+
+        # Find the largest connected component
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary_mask, 4, cv2.CV_32S)
+
+        if num_labels < 2:
+            logger.warning("AI detection: No components found in the mask.")
+            return None
+
+        # Find the label of the largest component (ignoring background at index 0)
+        largest_label = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
+
+        # Create a new mask containing only the largest component
+        new_mask = np.zeros_like(binary_mask)
+        new_mask[labels == largest_label] = 255
+
+        # Find contours on the refined mask
         contours, _ = cv2.findContours(
-            binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            new_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
 
         if not contours:
+            logger.warning("AI detection: No contours found after component analysis.")
             return None
 
         largest_contour = max(contours, key=cv2.contourArea)
