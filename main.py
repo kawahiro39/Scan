@@ -1,18 +1,66 @@
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 import base64
 import io
-import math
-# from google.cloud import vision
-# from PIL import Image
-# import cv2
-# import numpy as np
+import logging
+import os
+from typing import Optional
+from contextlib import asynccontextmanager
+
+import cv2
+import numpy as np
+from PIL import Image
+import requests
+from requests import RequestException
+
+try:
+    from google.api_core.exceptions import GoogleAPICallError
+    from google.auth.exceptions import DefaultCredentialsError
+    from google.cloud import vision
+except ImportError:  # pragma: no cover - optional dependency
+    vision = None  # type: ignore
+    GoogleAPICallError = DefaultCredentialsError = Exception  # type: ignore
+
+import torch
+import torchvision.transforms as T
+import segmentation_models_pytorch as smp
+
+def load_ai_model():
+    """Loads and initializes the AI model."""
+    global AI_MODEL
+    try:
+        logger.info("Initializing AI document detection model for application startup...")
+        model_name = "resnet34"
+        AI_MODEL = smp.Unet(
+            encoder_name=model_name,
+            encoder_weights="imagenet",
+            in_channels=3,
+            classes=1,
+        )
+        AI_MODEL.eval()
+        if torch.cuda.is_available():
+            AI_MODEL.to("cuda")
+        logger.info("AI model initialized successfully and is ready for inference.")
+    except Exception as e:
+        logger.error(f"Fatal error during AI model initialization: {e}")
+        # In a real-world scenario, you might want to prevent the app from starting.
+        AI_MODEL = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup event
+    load_ai_model()
+    yield
+    # Shutdown event (optional, for cleanup)
+    global AI_MODEL
+    AI_MODEL = None
+
 
 # FastAPIアプリケーションのインスタンスを作成
 app = FastAPI(
-    title="Document Scan API (Diagnostic Mode)",
-    description="An API to inspect incoming requests from Bubble.",
-    version="0.1.0-diag"
+    title="Document Scan API",
+    description="An API to scan documents using Google Cloud Vision and OpenCV.",
+    version="0.1.0",
+    lifespan=lifespan
 )
 
 logger = logging.getLogger(__name__)
@@ -455,45 +503,54 @@ def generate_pdf_response(image_bytes: bytes, color_mode: str = "mono") -> str:
     return f"data:application/pdf;base64,{pdf_base64}"
 
 @app.post("/scan")
-async def scan_document(request: Request):
+async def scan_document(
+    file: Optional[UploadFile] = File(None),
+    image_url: Optional[str] = Form(None),
+    color_mode: str = Form("mono"),
+):
     """
-    (Diagnostic Endpoint)
-    Receives a request and returns its headers and body to diagnose the
-    structure of the data sent by the client (Bubble).
+    Receives an image file via Form-data, processes it, and returns the result.
     """
     try:
-        # Get headers
-        headers = dict(request.headers)
+        if file is not None:
+            # Read the uploaded file into memory
+            image_bytes = await file.read()
 
-        # Get raw body
-        body_bytes = await request.body()
-        body_str = ""
-        try:
-            # Try to decode as utf-8 to see if it's readable text/form-data
-            body_str = body_bytes.decode('utf-8')
-        except UnicodeDecodeError:
-            # If it's not utf-8, it's likely binary data, so represent it as base64
-            body_str = base64.b64encode(body_bytes).decode('utf-8')
+            if not image_bytes:
+                raise HTTPException(status_code=400, detail="The uploaded file is empty.")
+        elif image_url:
+            image_bytes = fetch_image_from_url(image_url)
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="A file or image_url parameter must be provided.",
+            )
 
-        return JSONResponse(content={
-            "message": "Diagnostic data received. Please send this JSON back to the support agent.",
-            "headers": headers,
-            "body": body_str
-        })
+        normalized_color_mode = normalize_color_mode(color_mode)
 
+        # Process the document
+        corrected_image_bytes, extracted_text = process_document(
+            image_bytes, normalized_color_mode
+        )
+
+        # Generate the PDF response from the corrected image
+        pdf_data_uri = generate_pdf_response(
+            corrected_image_bytes, normalized_color_mode
+        )
+
+        # Return the final response
+        return {
+            "extracted_text": extracted_text,
+            "pdf_base64": pdf_data_uri
+        }
+
+    except HTTPException as e:
+        # Re-raise HTTPException to let FastAPI handle it
+        raise e
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"An internal server error occurred during diagnosis: {str(e)}")
-
+        # Catch any other unexpected errors
+        raise HTTPException(status_code=500, detail=f"An internal server error occurred: {str(e)}")
 
 @app.get("/")
 def read_root():
-    return {"message": "Welcome to the Document Scan API (Diagnostic Mode)"}
-
-# --- ORIGINAL CODE (COMMENTED OUT) ---
-# def process_document(image_bytes: bytes) -> tuple[bytes, str]:
-#     ...
-# def generate_pdf_response(image_bytes: bytes) -> str:
-#     ...
-# @app.post("/scan")
-# async def scan_document_original(file: UploadFile = File(...)):
-#     ...
+    return {"message": "Welcome to the Document Scan API"}
