@@ -1,7 +1,9 @@
 """
 Document Scanner Module
 Automatically detects and crops document boundaries from images using OpenCV
-Enhanced version with improved edge detection, rotation correction, and shadow removal
+Enhanced with techniques from:
+- DocShadow-SD7K (ICCV 2023): Frequency-aware shadow removal
+- DocScanner (IJCV 2025): Robust document localization
 """
 
 import cv2
@@ -70,9 +72,133 @@ class DocumentScanner:
         
         return maxWidth, maxHeight
     
+    def frequency_split(self, image: np.ndarray, sigma: float = 15.0) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Split image into low and high frequency components (DocShadow-SD7K technique)
+        
+        Args:
+            image: Input image
+            sigma: Gaussian blur sigma for low-pass filter
+            
+        Returns:
+            Tuple of (low_freq, high_freq) images
+        """
+        # Low frequency: Gaussian blur
+        low_freq = cv2.GaussianBlur(image, (0, 0), sigmaX=sigma)
+        
+        # High frequency: original - low frequency
+        high_freq = cv2.subtract(image, low_freq)
+        
+        return low_freq, high_freq
+    
+    def estimate_illumination_map(self, image: np.ndarray) -> np.ndarray:
+        """
+        Estimate illumination map using heavy Gaussian blur (DocShadow-SD7K technique)
+        
+        Args:
+            image: Grayscale image
+            
+        Returns:
+            Illumination map
+        """
+        # Convert to float
+        img_float = image.astype(np.float32)
+        
+        # Apply heavy Gaussian blur to estimate background illumination
+        illumination = cv2.GaussianBlur(img_float, (0, 0), sigmaX=50, sigmaY=50)
+        
+        return illumination
+    
+    def detect_shadow_mask(self, image: np.ndarray) -> np.ndarray:
+        """
+        Detect shadow regions using illumination ratio (DocShadow-SD7K technique)
+        
+        Args:
+            image: Input BGR image
+            
+        Returns:
+            Binary shadow mask
+        """
+        # Convert to LAB and extract L channel
+        lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+        l_channel = lab[:, :, 0].astype(np.float32)
+        
+        # Estimate background illumination
+        illumination = self.estimate_illumination_map(l_channel)
+        
+        # Compute illumination ratio (avoid division by zero)
+        ratio = (l_channel + 1.0) / (illumination + 1.0)
+        
+        # Shadows have lower ratio (< 0.92 threshold)
+        shadow_mask = (ratio < 0.92).astype(np.uint8) * 255
+        
+        # Refine mask with morphological operations
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+        shadow_mask = cv2.morphologyEx(shadow_mask, cv2.MORPH_CLOSE, kernel)
+        shadow_mask = cv2.morphologyEx(shadow_mask, cv2.MORPH_OPEN, kernel)
+        
+        # Apply Gaussian blur for soft edges
+        shadow_mask = cv2.GaussianBlur(shadow_mask, (31, 31), 0)
+        
+        return shadow_mask
+    
+    def remove_shadow_advanced(self, image: np.ndarray) -> np.ndarray:
+        """
+        Advanced shadow removal using frequency-aware processing (DocShadow-SD7K technique)
+        
+        Args:
+            image: Input BGR image
+            
+        Returns:
+            Shadow-removed image
+        """
+        # Split into low and high frequency
+        low_freq, high_freq = self.frequency_split(image, sigma=20.0)
+        
+        # Detect shadow mask
+        shadow_mask = self.detect_shadow_mask(image)
+        shadow_mask_norm = shadow_mask.astype(np.float32) / 255.0
+        
+        # Convert to LAB color space for better shadow correction
+        lab = cv2.cvtColor(low_freq, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        
+        # Estimate illumination on L channel
+        l_float = l.astype(np.float32)
+        illumination = self.estimate_illumination_map(l_float)
+        
+        # Compute correction factor for shadowed regions
+        # Brighten dark regions more
+        correction_factor = np.ones_like(l_float)
+        mask_bool = shadow_mask > 128
+        if np.any(mask_bool):
+            # Compute median of non-shadow and shadow regions
+            non_shadow_median = np.median(l_float[~mask_bool]) if np.any(~mask_bool) else 128
+            shadow_median = np.median(l_float[mask_bool])
+            
+            # Calculate brightening factor
+            if shadow_median > 0:
+                factor = non_shadow_median / shadow_median
+                factor = np.clip(factor, 1.0, 2.0)  # Limit factor
+                correction_factor[mask_bool] = factor
+        
+        # Apply correction with smooth transition
+        l_corrected = l_float * (1.0 + (correction_factor - 1.0) * shadow_mask_norm)
+        l_corrected = np.clip(l_corrected, 0, 255).astype(np.uint8)
+        
+        # Merge back to LAB
+        lab_corrected = cv2.merge([l_corrected, a, b])
+        low_freq_corrected = cv2.cvtColor(lab_corrected, cv2.COLOR_LAB2BGR)
+        
+        # Combine corrected low frequency with original high frequency
+        result = cv2.add(low_freq_corrected, high_freq)
+        result = np.clip(result, 0, 255).astype(np.uint8)
+        
+        return result
+    
     def preprocess_for_contour_detection(self, image: np.ndarray) -> np.ndarray:
         """
-        Enhanced preprocessing for better contour detection
+        Enhanced preprocessing for robust document localization (DocScanner technique)
         
         Args:
             image: Input BGR image
@@ -89,10 +215,14 @@ class DocumentScanner:
         # Apply Gaussian blur
         blurred = cv2.GaussianBlur(blurred, (5, 5), 0)
         
+        # Enhance contrast with CLAHE
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        enhanced = clahe.apply(blurred)
+        
         # Apply Canny edge detection on multiple scales
-        edges1 = cv2.Canny(blurred, 30, 100)
-        edges2 = cv2.Canny(blurred, 50, 150)
-        edges3 = cv2.Canny(blurred, 75, 200)
+        edges1 = cv2.Canny(enhanced, 30, 100)
+        edges2 = cv2.Canny(enhanced, 50, 150)
+        edges3 = cv2.Canny(enhanced, 75, 200)
         
         # Combine edges from different scales
         edges = cv2.bitwise_or(edges1, edges2)
@@ -103,14 +233,14 @@ class DocumentScanner:
         edges = cv2.dilate(edges, dilate_kernel, iterations=2)
         
         # Close small gaps
-        close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
         edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, close_kernel)
         
         return edges
     
     def find_document_contour(self, image: np.ndarray) -> Optional[np.ndarray]:
         """
-        Find the document contour in the image with improved detection
+        Find the document contour with robust localization (DocScanner technique)
         
         Args:
             image: Input BGR image
@@ -121,7 +251,7 @@ class DocumentScanner:
         # Get preprocessed edges
         edges = self.preprocess_for_contour_detection(image)
         
-        # Find contours
+        # Find contours (external only to avoid nested contours)
         contours, _ = cv2.findContours(edges.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
         # Sort contours by area in descending order
@@ -132,20 +262,24 @@ class DocumentScanner:
         img_area = img_height * img_width
         
         # Look for the first contour that can be approximated to 4 points
-        for contour in contours[:20]:  # Check top 20 largest contours
+        for contour in contours[:25]:  # Check top 25 largest contours
             # Calculate area ratio to filter out too small contours
             area = cv2.contourArea(contour)
             area_ratio = area / img_area
             
-            # Skip if contour is too small (less than 5% of image area)
-            if area_ratio < 0.05:
+            # Skip if contour is too small (less than 3% of image area)
+            if area_ratio < 0.03:
+                continue
+            
+            # Skip if contour is almost the entire image (likely image border)
+            if area_ratio > 0.98:
                 continue
             
             # Calculate perimeter
             peri = cv2.arcLength(contour, True)
             
             # Try multiple epsilon values for better approximation
-            for epsilon_factor in [0.015, 0.02, 0.025, 0.03, 0.035, 0.04]:
+            for epsilon_factor in [0.015, 0.02, 0.025, 0.03, 0.035, 0.04, 0.045, 0.05]:
                 approx = cv2.approxPolyDP(contour, epsilon_factor * peri, True)
                 
                 # If our approximated contour has 4 points, we found the document
@@ -177,7 +311,7 @@ class DocumentScanner:
         
         # Check aspect ratio (should be reasonable for documents)
         aspect_ratio = float(w) / h if h > 0 else 0
-        if aspect_ratio < 0.2 or aspect_ratio > 5.0:
+        if aspect_ratio < 0.15 or aspect_ratio > 6.0:
             return False
         
         # Check if the contour covers a reasonable portion of the image
@@ -186,8 +320,18 @@ class DocumentScanner:
         if bbox_area > 0:
             solidity = float(contour_area) / bbox_area
             # Document should have reasonable solidity
-            if solidity < 0.65:
+            if solidity < 0.60:
                 return False
+        
+        # Check if contour touches image borders (may indicate incomplete detection)
+        margin = 10
+        touches_border = (x < margin or y < margin or 
+                         (x + w) > (img_width - margin) or 
+                         (y + h) > (img_height - margin))
+        
+        # If touches border and is very large, it's likely the image border itself
+        if touches_border and contour_area / (img_width * img_height) > 0.95:
+            return False
         
         return True
     
@@ -224,68 +368,12 @@ class DocumentScanner:
         # Calculate the perspective transform matrix
         M = cv2.getPerspectiveTransform(rect, dst)
         
-        # Apply the perspective transformation
-        warped = cv2.warpPerspective(image, M, (maxWidth, maxHeight))
+        # Apply the perspective transformation with high-quality interpolation
+        warped = cv2.warpPerspective(image, M, (maxWidth, maxHeight), 
+                                     flags=cv2.INTER_CUBIC,
+                                     borderMode=cv2.BORDER_REPLICATE)
         
         return warped
-    
-    def remove_shadow(self, image: np.ndarray) -> np.ndarray:
-        """
-        Remove shadows from scanned document
-        
-        Args:
-            image: Input image
-            
-        Returns:
-            Image with shadows removed
-        """
-        # Convert to LAB color space
-        lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
-        l, a, b = cv2.split(lab)
-        
-        # Apply morphological operations to estimate background
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
-        bg = cv2.morphologyEx(l, cv2.MORPH_CLOSE, kernel)
-        
-        # Calculate the difference to remove shadows
-        diff = cv2.subtract(bg, l)
-        
-        # Normalize
-        norm = cv2.normalize(diff, None, alpha=0, beta=255, 
-                            norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_8U)
-        
-        # Merge back
-        result = cv2.merge([norm, a, b])
-        result = cv2.cvtColor(result, cv2.COLOR_LAB2BGR)
-        
-        return result
-    
-    def remove_bleed_through(self, image: np.ndarray) -> np.ndarray:
-        """
-        Remove bleed-through (show-through) from scanned documents
-        
-        Args:
-            image: Input image
-            
-        Returns:
-            Image with reduced bleed-through
-        """
-        # Convert to LAB color space
-        lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
-        l, a, b = cv2.split(lab)
-        
-        # Apply bilateral filter to L channel to reduce noise
-        l_filtered = cv2.bilateralFilter(l, 9, 75, 75)
-        
-        # Enhance L channel contrast slightly
-        clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))
-        l_enhanced = clahe.apply(l_filtered)
-        
-        # Merge back
-        result_lab = cv2.merge([l_enhanced, a, b])
-        result = cv2.cvtColor(result_lab, cv2.COLOR_LAB2BGR)
-        
-        return result
     
     def auto_rotate(self, image: np.ndarray) -> np.ndarray:
         """
@@ -307,7 +395,7 @@ class DocumentScanner:
         coords = np.column_stack(np.where(thresh > 0))
         
         # Calculate the rotation angle
-        if len(coords) > 0:
+        if len(coords) > 100:  # Need sufficient points
             angle = cv2.minAreaRect(coords)[-1]
             
             # Adjust angle
@@ -316,8 +404,8 @@ class DocumentScanner:
             elif angle > 45:
                 angle = angle - 90
             
-            # Only rotate if angle is significant (more than 0.5 degrees)
-            if abs(angle) > 0.5:
+            # Only rotate if angle is significant (more than 0.3 degrees)
+            if abs(angle) > 0.3:
                 # Get image dimensions
                 (h, w) = image.shape[:2]
                 center = (w // 2, h // 2)
@@ -333,53 +421,47 @@ class DocumentScanner:
         
         return image
     
-    def enhance_image(self, image: np.ndarray, remove_shadows: bool = True, 
-                     remove_bleed: bool = False) -> np.ndarray:
+    def enhance_image(self, image: np.ndarray, remove_shadows: bool = True) -> np.ndarray:
         """
-        Enhance the image quality using various techniques
+        Enhance the image quality using frequency-aware processing
         
         Args:
             image: Input image
-            remove_shadows: Whether to apply shadow removal
-            remove_bleed: Whether to apply bleed-through removal (aggressive, may lose color)
+            remove_shadows: Whether to apply advanced shadow removal
             
         Returns:
             Enhanced image
         """
         result = image.copy()
         
-        # Remove shadows first
+        # Remove shadows with frequency-aware method
         if remove_shadows:
-            result = self.remove_shadow(result)
+            result = self.remove_shadow_advanced(result)
         
-        # Apply gamma correction (lighter)
-        gamma = 1.2
+        # Apply gentle gamma correction
+        gamma = 1.15
         invGamma = 1.0 / gamma
         table = np.array([((i / 255.0) ** invGamma) * 255 
                          for i in np.arange(0, 256)]).astype("uint8")
         result = cv2.LUT(result, table)
         
-        # Apply CLAHE to L channel in LAB color space (moderate)
+        # Apply CLAHE to L channel in LAB color space
         lab = cv2.cvtColor(result, cv2.COLOR_BGR2LAB)
         l, a, b = cv2.split(lab)
         
-        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         l = clahe.apply(l)
         
         lab = cv2.merge((l, a, b))
         result = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
         
-        # Remove bleed-through only if explicitly requested
-        if remove_bleed:
-            result = self.remove_bleed_through(result)
+        # Gentle contrast enhancement
+        result = cv2.convertScaleAbs(result, alpha=1.05, beta=2)
         
-        # Increase contrast slightly (gentler)
-        result = cv2.convertScaleAbs(result, alpha=1.08, beta=3)
-        
-        # Apply slight sharpening (gentler)
+        # Apply gentle sharpening
         kernel = np.array([[0, -1, 0],
-                          [-1, 5, -1],
-                          [0, -1, 0]])
+                          [-1, 5.5, -1],
+                          [0, -1, 0]]) / 1.5
         result = cv2.filter2D(result, -1, kernel)
         
         return result
@@ -402,7 +484,7 @@ class DocumentScanner:
         orig_height, orig_width = image.shape[:2]
         
         # Resize for processing if image is too large
-        max_dimension = 2000  # Increased for better detection
+        max_dimension = 2048  # Increased for better detection
         if max(orig_height, orig_width) > max_dimension:
             scale = max_dimension / max(orig_height, orig_width)
             work_image = cv2.resize(image, None, fx=scale, fy=scale, 
@@ -418,7 +500,7 @@ class DocumentScanner:
             # If no document found, try to auto-rotate and enhance
             if enhance:
                 rotated = self.auto_rotate(image)
-                enhanced = self.enhance_image(rotated)
+                enhanced = self.enhance_image(rotated, remove_shadows=True)
                 return enhanced, "No document boundary detected, returning enhanced and rotated original"
             return image, "No document boundary detected, returning original"
         
@@ -439,6 +521,6 @@ class DocumentScanner:
         
         # Enhance if requested
         if enhance:
-            warped = self.enhance_image(warped, remove_shadows=True, remove_bleed=False)
+            warped = self.enhance_image(warped, remove_shadows=True)
         
         return warped, "Document successfully scanned and processed"
