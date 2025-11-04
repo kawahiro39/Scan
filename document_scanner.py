@@ -84,33 +84,27 @@ class DocumentScanner:
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         
         # Apply bilateral filter to reduce noise while keeping edges sharp
-        blurred = cv2.bilateralFilter(gray, 11, 17, 17)
+        blurred = cv2.bilateralFilter(gray, 9, 75, 75)
         
-        # Apply morphological operations to close gaps
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-        morph = cv2.morphologyEx(blurred, cv2.MORPH_CLOSE, kernel)
-        
-        # Apply adaptive thresholding for better edge detection
-        thresh = cv2.adaptiveThreshold(
-            morph, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-            cv2.THRESH_BINARY, 11, 2
-        )
-        
-        # Dilate to connect nearby edges
-        dilate_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-        dilated = cv2.dilate(thresh, dilate_kernel, iterations=1)
+        # Apply Gaussian blur
+        blurred = cv2.GaussianBlur(blurred, (5, 5), 0)
         
         # Apply Canny edge detection on multiple scales
         edges1 = cv2.Canny(blurred, 30, 100)
         edges2 = cv2.Canny(blurred, 50, 150)
-        edges3 = cv2.Canny(blurred, 70, 200)
+        edges3 = cv2.Canny(blurred, 75, 200)
         
         # Combine edges from different scales
         edges = cv2.bitwise_or(edges1, edges2)
         edges = cv2.bitwise_or(edges, edges3)
         
         # Dilate edges to connect broken segments
-        edges = cv2.dilate(edges, dilate_kernel, iterations=1)
+        dilate_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        edges = cv2.dilate(edges, dilate_kernel, iterations=2)
+        
+        # Close small gaps
+        close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, close_kernel)
         
         return edges
     
@@ -128,7 +122,7 @@ class DocumentScanner:
         edges = self.preprocess_for_contour_detection(image)
         
         # Find contours
-        contours, _ = cv2.findContours(edges.copy(), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+        contours, _ = cv2.findContours(edges.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
         # Sort contours by area in descending order
         contours = sorted(contours, key=cv2.contourArea, reverse=True)
@@ -138,20 +132,20 @@ class DocumentScanner:
         img_area = img_height * img_width
         
         # Look for the first contour that can be approximated to 4 points
-        for contour in contours[:15]:  # Check top 15 largest contours
+        for contour in contours[:20]:  # Check top 20 largest contours
             # Calculate area ratio to filter out too small contours
             area = cv2.contourArea(contour)
             area_ratio = area / img_area
             
-            # Skip if contour is too small (less than 10% of image area)
-            if area_ratio < 0.1:
+            # Skip if contour is too small (less than 5% of image area)
+            if area_ratio < 0.05:
                 continue
             
             # Calculate perimeter
             peri = cv2.arcLength(contour, True)
             
             # Try multiple epsilon values for better approximation
-            for epsilon_factor in [0.01, 0.015, 0.02, 0.025, 0.03]:
+            for epsilon_factor in [0.015, 0.02, 0.025, 0.03, 0.035, 0.04]:
                 approx = cv2.approxPolyDP(contour, epsilon_factor * peri, True)
                 
                 # If our approximated contour has 4 points, we found the document
@@ -183,7 +177,7 @@ class DocumentScanner:
         
         # Check aspect ratio (should be reasonable for documents)
         aspect_ratio = float(w) / h if h > 0 else 0
-        if aspect_ratio < 0.3 or aspect_ratio > 3.5:
+        if aspect_ratio < 0.2 or aspect_ratio > 5.0:
             return False
         
         # Check if the contour covers a reasonable portion of the image
@@ -191,8 +185,8 @@ class DocumentScanner:
         bbox_area = w * h
         if bbox_area > 0:
             solidity = float(contour_area) / bbox_area
-            # Document should have high solidity (close to rectangle)
-            if solidity < 0.7:
+            # Document should have reasonable solidity
+            if solidity < 0.65:
                 return False
         
         return True
@@ -276,26 +270,22 @@ class DocumentScanner:
         Returns:
             Image with reduced bleed-through
         """
-        # Convert to grayscale
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        # Convert to LAB color space
+        lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
         
-        # Apply bilateral filter to smooth while preserving edges
-        filtered = cv2.bilateralFilter(gray, 9, 75, 75)
+        # Apply bilateral filter to L channel to reduce noise
+        l_filtered = cv2.bilateralFilter(l, 9, 75, 75)
         
-        # Apply adaptive thresholding to separate text from background
-        thresh = cv2.adaptiveThreshold(
-            filtered, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY, 15, 10
-        )
+        # Enhance L channel contrast slightly
+        clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))
+        l_enhanced = clahe.apply(l_filtered)
         
-        # Convert back to BGR
-        result = cv2.cvtColor(thresh, cv2.COLOR_GRAY2BGR)
+        # Merge back
+        result_lab = cv2.merge([l_enhanced, a, b])
+        result = cv2.cvtColor(result_lab, cv2.COLOR_LAB2BGR)
         
-        # Blend with original for more natural look
-        alpha = 0.7
-        blended = cv2.addWeighted(image, alpha, result, 1 - alpha, 0)
-        
-        return blended
+        return result
     
     def auto_rotate(self, image: np.ndarray) -> np.ndarray:
         """
@@ -344,14 +334,14 @@ class DocumentScanner:
         return image
     
     def enhance_image(self, image: np.ndarray, remove_shadows: bool = True, 
-                     remove_bleed: bool = True) -> np.ndarray:
+                     remove_bleed: bool = False) -> np.ndarray:
         """
         Enhance the image quality using various techniques
         
         Args:
             image: Input image
             remove_shadows: Whether to apply shadow removal
-            remove_bleed: Whether to apply bleed-through removal
+            remove_bleed: Whether to apply bleed-through removal (aggressive, may lose color)
             
         Returns:
             Enhanced image
@@ -362,34 +352,34 @@ class DocumentScanner:
         if remove_shadows:
             result = self.remove_shadow(result)
         
-        # Apply gamma correction
-        gamma = 1.3
+        # Apply gamma correction (lighter)
+        gamma = 1.2
         invGamma = 1.0 / gamma
         table = np.array([((i / 255.0) ** invGamma) * 255 
                          for i in np.arange(0, 256)]).astype("uint8")
         result = cv2.LUT(result, table)
         
-        # Apply CLAHE to L channel in LAB color space
+        # Apply CLAHE to L channel in LAB color space (moderate)
         lab = cv2.cvtColor(result, cv2.COLOR_BGR2LAB)
         l, a, b = cv2.split(lab)
         
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
         l = clahe.apply(l)
         
         lab = cv2.merge((l, a, b))
         result = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
         
-        # Remove bleed-through
+        # Remove bleed-through only if explicitly requested
         if remove_bleed:
             result = self.remove_bleed_through(result)
         
-        # Increase contrast slightly
-        result = cv2.convertScaleAbs(result, alpha=1.1, beta=5)
+        # Increase contrast slightly (gentler)
+        result = cv2.convertScaleAbs(result, alpha=1.08, beta=3)
         
-        # Apply slight sharpening
-        kernel = np.array([[-1, -1, -1],
-                          [-1,  9, -1],
-                          [-1, -1, -1]]) / 1.5
+        # Apply slight sharpening (gentler)
+        kernel = np.array([[0, -1, 0],
+                          [-1, 5, -1],
+                          [0, -1, 0]])
         result = cv2.filter2D(result, -1, kernel)
         
         return result
@@ -449,6 +439,6 @@ class DocumentScanner:
         
         # Enhance if requested
         if enhance:
-            warped = self.enhance_image(warped, remove_shadows=True, remove_bleed=True)
+            warped = self.enhance_image(warped, remove_shadows=True, remove_bleed=False)
         
         return warped, "Document successfully scanned and processed"
